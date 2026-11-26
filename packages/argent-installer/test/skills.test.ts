@@ -37,10 +37,44 @@ vi.mock("../src/utils.js", async (importOriginal) => {
   };
 });
 
+// `resolveSkillsRunner` scans the real PATH, which may lack npx (#1206). Mock
+// it so these tests see a fixed npx runner, and switch to pnpm dlx on demand.
+// `skillsCommand` is pinned to the POSIX shape so the assertions below hold
+// when the suite runs on Windows; skills-runner.test.ts covers the win32 one.
+const { resolveSkillsRunnerMock } = vi.hoisted(() => ({
+  resolveSkillsRunnerMock: vi.fn(),
+}));
+
+vi.mock("../src/skills-runner.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../src/skills-runner.js")>();
+  return {
+    ...actual,
+    resolveSkillsRunner: resolveSkillsRunnerMock,
+    skillsCommand: (runner: SkillsRunner, args: string[]) =>
+      actual.skillsCommand(runner, args, "linux"),
+  };
+});
+
 import { refreshArgentSkills, formatSkillRefreshSummary } from "../src/skills.js";
+import type { SkillsRunner } from "../src/skills-runner.js";
+
+const npxRunner = {
+  kind: "npx" as const,
+  bin: "npx",
+  buildArgs: (args: string[]) => ["--force", ...args],
+  label: "npx",
+};
+
+const pnpmDlxRunner = {
+  kind: "pnpm" as const,
+  bin: "pnpm",
+  buildArgs: (args: string[]) => ["dlx", ...args],
+  label: "pnpm dlx",
+};
 
 let tmpDir: string;
 const originalXdg = process.env.XDG_STATE_HOME;
+const originalHome = process.env.HOME;
 
 function writeLock(lockPath: string, skills: Record<string, Record<string, unknown>>): void {
   fs.mkdirSync(path.dirname(lockPath), { recursive: true });
@@ -51,15 +85,21 @@ beforeEach(() => {
   tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "argent-skills-test-"));
   execFileSyncMock.mockReset();
   listBundledSkillsMock.mockReset();
+  resolveSkillsRunnerMock.mockReset();
+  resolveSkillsRunnerMock.mockReturnValue(npxRunner);
   // Point the global lock at a per-test directory so we never touch the
   // user's real ~/.agents/.skill-lock.json during the suite.
   process.env.XDG_STATE_HOME = path.join(tmpDir, "xdg");
+  // The legacy-dir prune resolves global skill dirs from homedir().
+  process.env.HOME = path.join(tmpDir, "home");
 });
 
 afterEach(() => {
   fs.rmSync(tmpDir, { recursive: true, force: true });
   if (originalXdg === undefined) delete process.env.XDG_STATE_HOME;
   else process.env.XDG_STATE_HOME = originalXdg;
+  if (originalHome === undefined) delete process.env.HOME;
+  else process.env.HOME = originalHome;
 });
 
 describe("refreshArgentSkills", () => {
@@ -70,7 +110,7 @@ describe("refreshArgentSkills", () => {
     // them all from both scopes.
     listBundledSkillsMock.mockReturnValue([]);
     writeLock(path.join(tmpDir, "skills-lock.json"), {
-      "argent-create-flow": {},
+      "argent-create-e2e": {},
       "argent-device-interact": {},
     });
 
@@ -84,8 +124,8 @@ describe("refreshArgentSkills", () => {
     // The refresh can run as a detached updater whose inherited cwd is the
     // tool-server's editor-chosen one; project-scope `skills` commands act on
     // their cwd.
-    listBundledSkillsMock.mockReturnValue(["argent-create-flow"]);
-    writeLock(path.join(tmpDir, "skills-lock.json"), { "argent-create-flow": {} });
+    listBundledSkillsMock.mockReturnValue(["argent-create-e2e"]);
+    writeLock(path.join(tmpDir, "skills-lock.json"), { "argent-create-e2e": {} });
 
     refreshArgentSkills(tmpDir);
 
@@ -96,8 +136,31 @@ describe("refreshArgentSkills", () => {
     );
   });
 
+  it("runs the skills CLI without an inherited npm_config_package", () => {
+    // Under `npx --package @swmansion/argent -- argent ...`, npm exports
+    // npm_config_package; a nested `npx skills` would otherwise reinstall argent
+    // instead of the skills CLI (#1335).
+    listBundledSkillsMock.mockReturnValue(["argent-create-e2e"]);
+    writeLock(path.join(tmpDir, "skills-lock.json"), { "argent-create-e2e": {} });
+    const original = process.env.npm_config_package;
+    process.env.npm_config_package = "@swmansion/argent@latest";
+    try {
+      refreshArgentSkills(tmpDir);
+    } finally {
+      if (original === undefined) delete process.env.npm_config_package;
+      else process.env.npm_config_package = original;
+    }
+
+    expect(execFileSyncMock).toHaveBeenCalled();
+    for (const call of execFileSyncMock.mock.calls) {
+      const opts = call[2] as { env?: NodeJS.ProcessEnv };
+      expect(opts.env).toBeDefined();
+      expect(opts.env).not.toHaveProperty("npm_config_package");
+    }
+  });
+
   it("returns an empty array when no scope tracks argent skills", () => {
-    listBundledSkillsMock.mockReturnValue(["argent-create-flow"]);
+    listBundledSkillsMock.mockReturnValue(["argent-create-e2e"]);
 
     const results = refreshArgentSkills(tmpDir);
 
@@ -108,9 +171,9 @@ describe("refreshArgentSkills", () => {
   });
 
   it("resyncs a tracked project scope when the lock has an argent skill", () => {
-    listBundledSkillsMock.mockReturnValue(["argent-create-flow", "argent-ios-simulator-setup"]);
+    listBundledSkillsMock.mockReturnValue(["argent-create-e2e", "argent-ios-simulator-setup"]);
     writeLock(path.join(tmpDir, "skills-lock.json"), {
-      "argent-create-flow": {},
+      "argent-create-e2e": {},
     });
 
     const results = refreshArgentSkills(tmpDir);
@@ -130,10 +193,57 @@ describe("refreshArgentSkills", () => {
     expect(args.indexOf("--force")).toBeLessThan(args.indexOf("skills"));
   });
 
-  it("resyncs a tracked global scope with the -g flag", () => {
+  it("prunes only lockfile names shaped like argent's own skills", () => {
     listBundledSkillsMock.mockReturnValue(["argent-create-flow"]);
-    writeLock(path.join(tmpDir, "xdg", "skills", ".skill-lock.json"), {
+    writeLock(path.join(tmpDir, "skills-lock.json"), {
       "argent-create-flow": {},
+      "argent-old-skill": {},
+      'argent-x" & calc & "': {},
+      "argent-%PATH%": {},
+    });
+
+    const results = refreshArgentSkills(tmpDir);
+
+    expect(results[0]!.pruned).toEqual(["argent-old-skill"]);
+    const [, removeArgs] = execFileSyncMock.mock.calls[1]! as [string, string[]];
+    expect(removeArgs.filter((arg) => arg.startsWith("argent-"))).toEqual(["argent-old-skill"]);
+  });
+
+  it("launches nothing and reports a sync error when no runner is on PATH", () => {
+    resolveSkillsRunnerMock.mockReturnValue(null);
+    listBundledSkillsMock.mockReturnValue(["argent-create-flow"]);
+    writeLock(path.join(tmpDir, "skills-lock.json"), {
+      "argent-create-flow": {},
+    });
+
+    const results = refreshArgentSkills(tmpDir);
+
+    expect(execFileSyncMock).not.toHaveBeenCalled();
+    expect(results[0]!.syncError).toBe("no package runner on PATH");
+  });
+
+  it("runs the skills CLI through `pnpm dlx` when the resolver picks pnpm (#1206)", () => {
+    resolveSkillsRunnerMock.mockReturnValue(pnpmDlxRunner);
+    listBundledSkillsMock.mockReturnValue(["argent-create-flow"]);
+    writeLock(path.join(tmpDir, "skills-lock.json"), {
+      "argent-create-flow": {},
+    });
+
+    refreshArgentSkills(tmpDir);
+
+    expect(execFileSyncMock).toHaveBeenCalledTimes(1);
+    const [bin, args] = execFileSyncMock.mock.calls[0]! as [string, string[]];
+    expect(bin).toBe("pnpm");
+    // pnpm dlx has no npm-only `--force` flag; it just needs the leading `dlx`.
+    expect(args[0]).toBe("dlx");
+    expect(args).not.toContain("--force");
+    expect(args).toContain("add");
+  });
+
+  it("resyncs a tracked global scope with the -g flag", () => {
+    listBundledSkillsMock.mockReturnValue(["argent-create-e2e"]);
+    writeLock(path.join(tmpDir, "xdg", "skills", ".skill-lock.json"), {
+      "argent-create-e2e": {},
     });
 
     const results = refreshArgentSkills(tmpDir);
@@ -146,9 +256,9 @@ describe("refreshArgentSkills", () => {
   });
 
   it("prunes argent skills that are no longer bundled", () => {
-    listBundledSkillsMock.mockReturnValue(["argent-create-flow"]);
+    listBundledSkillsMock.mockReturnValue(["argent-create-e2e"]);
     writeLock(path.join(tmpDir, "skills-lock.json"), {
-      "argent-create-flow": {},
+      "argent-create-e2e": {},
       "argent-super-workflow": {}, // was removed from bundled set
     });
 
@@ -164,9 +274,9 @@ describe("refreshArgentSkills", () => {
   });
 
   it("does not touch non-argent skills even if they sit in the same lock", () => {
-    listBundledSkillsMock.mockReturnValue(["argent-create-flow"]);
+    listBundledSkillsMock.mockReturnValue(["argent-create-e2e"]);
     writeLock(path.join(tmpDir, "skills-lock.json"), {
-      "argent-create-flow": {},
+      "argent-create-e2e": {},
       "vercel-agent-skills": {},
       "my-custom-skill": {},
     });
@@ -185,10 +295,10 @@ describe("refreshArgentSkills", () => {
   });
 
   it("refreshes both scopes when both track argent skills", () => {
-    listBundledSkillsMock.mockReturnValue(["argent-create-flow"]);
-    writeLock(path.join(tmpDir, "skills-lock.json"), { "argent-create-flow": {} });
+    listBundledSkillsMock.mockReturnValue(["argent-create-e2e"]);
+    writeLock(path.join(tmpDir, "skills-lock.json"), { "argent-create-e2e": {} });
     writeLock(path.join(tmpDir, "xdg", "skills", ".skill-lock.json"), {
-      "argent-create-flow": {},
+      "argent-create-e2e": {},
     });
 
     const results = refreshArgentSkills(tmpDir);
@@ -197,9 +307,9 @@ describe("refreshArgentSkills", () => {
   });
 
   it("records sync errors without aborting the scope or skipping prune", () => {
-    listBundledSkillsMock.mockReturnValue(["argent-create-flow"]);
+    listBundledSkillsMock.mockReturnValue(["argent-create-e2e"]);
     writeLock(path.join(tmpDir, "skills-lock.json"), {
-      "argent-create-flow": {},
+      "argent-create-e2e": {},
       "argent-old-workflow": {},
     });
 
@@ -221,9 +331,9 @@ describe("refreshArgentSkills", () => {
   });
 
   it("records prune errors independently of sync success", () => {
-    listBundledSkillsMock.mockReturnValue(["argent-create-flow"]);
+    listBundledSkillsMock.mockReturnValue(["argent-create-e2e"]);
     writeLock(path.join(tmpDir, "skills-lock.json"), {
-      "argent-create-flow": {},
+      "argent-create-e2e": {},
       "argent-old-workflow": {},
     });
 
@@ -240,6 +350,39 @@ describe("refreshArgentSkills", () => {
       pruned: [],
       pruneError: "permission denied",
     });
+  });
+
+  it("removes untracked legacy skill dirs and their editor links", () => {
+    listBundledSkillsMock.mockReturnValue(["argent-create-e2e"]);
+    writeLock(path.join(tmpDir, "skills-lock.json"), { "argent-create-e2e": {} });
+    const store = path.join(tmpDir, ".agents", "skills");
+    fs.mkdirSync(path.join(store, "argent-create-flow"), { recursive: true });
+    fs.writeFileSync(path.join(store, "argent-create-flow", "SKILL.md"), "old");
+    fs.mkdirSync(path.join(store, "my-skill"), { recursive: true });
+    const editor = path.join(tmpDir, ".claude", "skills");
+    fs.mkdirSync(editor, { recursive: true });
+    // Dangles once the store copy above is gone.
+    fs.symlinkSync(path.join(store, "argent-qa-flows"), path.join(editor, "argent-qa-flows"));
+
+    const results = refreshArgentSkills(tmpDir);
+
+    expect(results[0]!.pruned).toEqual(["argent-create-flow", "argent-qa-flows"]);
+    expect(fs.existsSync(path.join(store, "argent-create-flow"))).toBe(false);
+    expect(fs.lstatSync(path.join(editor, "argent-qa-flows"), { throwIfNoEntry: false })).toBe(
+      undefined
+    );
+    expect(fs.existsSync(path.join(store, "my-skill"))).toBe(true);
+    // Removed from disk directly: no lock entry, so no `skills remove` run.
+    expect(execFileSyncMock).toHaveBeenCalledTimes(1);
+  });
+
+  it("leaves legacy skill dirs alone in a scope that tracks no argent skill", () => {
+    listBundledSkillsMock.mockReturnValue(["argent-create-e2e"]);
+    const legacy = path.join(tmpDir, ".agents", "skills", "argent-create-flow");
+    fs.mkdirSync(legacy, { recursive: true });
+
+    expect(refreshArgentSkills(tmpDir)).toEqual([]);
+    expect(fs.existsSync(legacy)).toBe(true);
   });
 });
 
@@ -284,5 +427,20 @@ describe("formatSkillRefreshSummary", () => {
     expect(summary).toContain("network down");
     expect(summary).toContain("prune failed");
     expect(summary).toContain("permission denied");
+  });
+
+  it("says no package runner was found instead of a raw sync error", () => {
+    const summary = formatSkillRefreshSummary([
+      {
+        scope: "project",
+        synced: 0,
+        syncError: "no package runner on PATH",
+        pruned: [],
+        pruneError: null,
+      },
+    ]);
+    expect(summary).toContain("not synced");
+    expect(summary).toContain("no package runner");
+    expect(summary).not.toContain("sync failed");
   });
 });

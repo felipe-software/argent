@@ -8,10 +8,13 @@ import type { RegistryInfo } from "@argent/update-core";
 // (with their own low-level tests there). The checker only orchestrates them,
 // so we mock that boundary and keep the real, pure pickInstallableTarget.
 // vi.hoisted keeps the same fn instances across the vi.resetModules() below.
-const { mockFetchRegistryInfo, mockDetectMinReleaseAgeMs } = vi.hoisted(() => ({
-  mockFetchRegistryInfo: vi.fn<() => Promise<RegistryInfo | null>>(),
-  mockDetectMinReleaseAgeMs: vi.fn<() => Promise<number>>(),
-}));
+const { mockFetchRegistryInfo, mockDetectMinReleaseAgeMs, mockGetConfigValueByKey } = vi.hoisted(
+  () => ({
+    mockFetchRegistryInfo: vi.fn<() => Promise<RegistryInfo | null>>(),
+    mockDetectMinReleaseAgeMs: vi.fn<() => Promise<number>>(),
+    mockGetConfigValueByKey: vi.fn<(key: string) => unknown>(),
+  })
+);
 vi.mock("@argent/update-core", async (importActual) => {
   const actual = await importActual<typeof import("@argent/update-core")>();
   return {
@@ -20,6 +23,9 @@ vi.mock("@argent/update-core", async (importActual) => {
     detectMinReleaseAgeMs: mockDetectMinReleaseAgeMs,
   };
 });
+vi.mock("@argent/configuration-core", () => ({
+  getConfigValueByKey: mockGetConfigValueByKey,
+}));
 
 let getUpdateState: typeof import("../src/utils/update-checker").getUpdateState;
 let startUpdateChecker: typeof import("../src/utils/update-checker").startUpdateChecker;
@@ -46,6 +52,8 @@ describe("update-checker", () => {
     mockFetchRegistryInfo.mockReset();
     mockDetectMinReleaseAgeMs.mockReset();
     mockDetectMinReleaseAgeMs.mockResolvedValue(0); // no policy by default
+    mockGetConfigValueByKey.mockReset();
+    mockGetConfigValueByKey.mockReturnValue(false);
 
     // Re-import after module reset so each test gets fresh state.
     const mod = await import("../src/utils/update-checker");
@@ -119,6 +127,31 @@ describe("update-checker", () => {
     handle.dispose();
   });
 
+  it("requests the existing updater when autoUpdate.enabled is true", async () => {
+    mockFetchRegistryInfo.mockResolvedValue(singleVersion("99.0.0", "2020-01-01T00:00:00Z"));
+    mockGetConfigValueByKey.mockReturnValue(true);
+    const onAutoUpdate = vi.fn();
+
+    const handle = startUpdateChecker({ onAutoUpdate });
+    await vi.advanceTimersByTimeAsync(0);
+
+    expect(mockGetConfigValueByKey).toHaveBeenCalledWith("autoUpdate.enabled");
+    expect(onAutoUpdate).toHaveBeenCalledOnce();
+    expect(onAutoUpdate).toHaveBeenCalledWith("99.0.0");
+    handle.dispose();
+  });
+
+  it("does not request an automatic update while autoUpdate.enabled is false", async () => {
+    mockFetchRegistryInfo.mockResolvedValue(singleVersion("99.0.0", "2020-01-01T00:00:00Z"));
+    const onAutoUpdate = vi.fn();
+
+    const handle = startUpdateChecker({ onAutoUpdate });
+    await vi.advanceTimersByTimeAsync(0);
+
+    expect(onAutoUpdate).not.toHaveBeenCalled();
+    handle.dispose();
+  });
+
   it("stops checking after dispose", async () => {
     mockFetchRegistryInfo.mockResolvedValue(singleVersion("99.0.0", "2020-01-01T00:00:00Z"));
 
@@ -130,6 +163,54 @@ describe("update-checker", () => {
 
     await vi.advanceTimersByTimeAsync(60 * 60 * 1000);
     expect(mockFetchRegistryInfo).toHaveBeenCalledTimes(1); // No additional calls after dispose.
+  });
+
+  it("ignores an in-flight check after dispose", async () => {
+    let resolveFetch!: (info: RegistryInfo | null) => void;
+    mockFetchRegistryInfo.mockImplementation(
+      () =>
+        new Promise((resolve) => {
+          resolveFetch = resolve;
+        })
+    );
+    mockGetConfigValueByKey.mockReturnValue(true);
+    const onAutoUpdate = vi.fn();
+
+    const handle = startUpdateChecker({ onAutoUpdate });
+    handle.dispose();
+
+    resolveFetch(singleVersion("99.0.0", "2020-01-01T00:00:00Z"));
+    await vi.advanceTimersByTimeAsync(0);
+
+    expect(mockDetectMinReleaseAgeMs).not.toHaveBeenCalled();
+    expect(mockGetConfigValueByKey).not.toHaveBeenCalled();
+    expect(onAutoUpdate).not.toHaveBeenCalled();
+    expect(getUpdateState().updateAvailable).toBe(false);
+  });
+
+  it("does not finish a check disposed during the release-age probe", async () => {
+    mockFetchRegistryInfo.mockResolvedValue(singleVersion("99.0.0", "2020-01-01T00:00:00Z"));
+    let resolveReleaseAge!: (ageMs: number) => void;
+    mockDetectMinReleaseAgeMs.mockImplementation(
+      () =>
+        new Promise((resolve) => {
+          resolveReleaseAge = resolve;
+        })
+    );
+    mockGetConfigValueByKey.mockReturnValue(true);
+    const onAutoUpdate = vi.fn();
+
+    const handle = startUpdateChecker({ onAutoUpdate });
+    await vi.advanceTimersByTimeAsync(0);
+    expect(mockDetectMinReleaseAgeMs).toHaveBeenCalledOnce();
+
+    handle.dispose();
+    resolveReleaseAge(0);
+    await vi.advanceTimersByTimeAsync(0);
+
+    expect(mockGetConfigValueByKey).not.toHaveBeenCalled();
+    expect(onAutoUpdate).not.toHaveBeenCalled();
+    expect(getUpdateState().updateAvailable).toBe(false);
   });
 
   // ── Semver comparison ─────────────────────────────────────────────
@@ -354,10 +435,58 @@ describe("update-checker — suppression persistence", () => {
     expect(second.isUpdateNoteSuppressed()).toBe(true);
   });
 
-  it("throws when the suppression file cannot be written", async () => {
-    // Replace the .argent path with a regular file so mkdir/write fails.
+  it("reports an unwritable file and stays quiet in this process", async () => {
     fs.writeFileSync(path.join(tmpHome, ".argent"), "");
+    const { suppressUpdateNote, isUpdateNoteSuppressed } =
+      await import("../src/utils/update-checker");
+    expect(suppressUpdateNote(1000).persisted).toBe(false);
+    expect(isUpdateNoteSuppressed()).toBe(true);
+    vi.advanceTimersByTime(1001);
+    expect(isUpdateNoteSuppressed()).toBe(false);
+  });
+
+  it("replaces the file instead of rewriting it, and leaves no temp file", async () => {
     const { suppressUpdateNote } = await import("../src/utils/update-checker");
-    expect(() => suppressUpdateNote(1000)).toThrow();
+    suppressUpdateNote(1000);
+    const firstWrite = fs.statSync(suppressionFile()).ino;
+
+    expect(suppressUpdateNote(2000).persisted).toBe(true);
+
+    // A new inode means a concurrent reader sees the old file or the new one, never an empty one.
+    expect(fs.statSync(suppressionFile()).ino).not.toBe(firstWrite);
+    expect(fs.readdirSync(path.dirname(suppressionFile()))).toEqual(["update-suppression.json"]);
+  });
+
+  it("reports a failed replace and leaves no temp file", async () => {
+    // A directory at the target lets the temp file be written and fails the rename.
+    fs.mkdirSync(suppressionFile(), { recursive: true });
+    const { suppressUpdateNote, isUpdateNoteSuppressed } =
+      await import("../src/utils/update-checker");
+
+    expect(suppressUpdateNote(1000).persisted).toBe(false);
+
+    expect(isUpdateNoteSuppressed()).toBe(true);
+    expect(fs.readdirSync(path.dirname(suppressionFile()))).toEqual(["update-suppression.json"]);
+  });
+
+  it("honours a dismissal that another tool-server wrote after this one started", async () => {
+    const sibling = await import("../src/utils/update-checker");
+    vi.resetModules();
+    const local = await import("../src/utils/update-checker");
+    expect(local.isUpdateNoteSuppressed()).toBe(false);
+    sibling.suppressUpdateNote(7 * 24 * 60 * 60 * 1000);
+    expect(local.isUpdateNoteSuppressed()).toBe(true);
+    // http.ts only auto-suppresses when not suppressed, so the week survives.
+    expect(JSON.parse(fs.readFileSync(suppressionFile(), "utf8")).suppressUntil).toBe(
+      Date.now() + 7 * 24 * 60 * 60 * 1000
+    );
+  });
+
+  it("treats a cleared file as not suppressed, even after a longer local dismissal", async () => {
+    const { suppressUpdateNote, isUpdateNoteSuppressed } =
+      await import("../src/utils/update-checker");
+    suppressUpdateNote(60 * 60 * 1000);
+    suppressUpdateNote(0);
+    expect(isUpdateNoteSuppressed()).toBe(false);
   });
 });

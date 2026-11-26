@@ -1,7 +1,30 @@
+import { createHash } from "crypto";
+import * as os from "os";
+import * as path from "path";
 import { promises as fs } from "fs";
 import { FAILURE_CODES, FailureError } from "@argent/registry";
 import type { ScreenRecordingSessionApi } from "../../blueprints/screen-recording-session";
 import { describeReapedSession, takeReapedSession } from "../../utils/reaped-sessions";
+
+/**
+ * The most of the device id a video's file name holds. A Mac app's bundle id
+ * has no length limit, and a file name at most 255 bytes.
+ */
+const MAX_DEVICE_ID_IN_NAME = 80;
+
+/**
+ * Where a capture writes its video: a new file in `dir`, named after the
+ * device and the time. A longer device id is cut and ends in a hash of the
+ * whole id, so two long ids with the same start still get different names.
+ */
+export function recordingOutputPath(deviceId: string, dir: string = os.tmpdir()): string {
+  let id = deviceId.replace(/[^A-Za-z0-9._-]/g, "-");
+  if (id.length > MAX_DEVICE_ID_IN_NAME) {
+    const hash = createHash("sha256").update(deviceId).digest("hex").slice(0, 12);
+    id = `${id.slice(0, MAX_DEVICE_ID_IN_NAME - hash.length - 1)}-${hash}`;
+  }
+  return path.join(dir, `argent-screen-recording-${id}-${Date.now()}.mp4`);
+}
 
 export interface StartRecordingResult {
   status: "recording";
@@ -9,6 +32,12 @@ export interface StartRecordingResult {
   timeLimitSeconds: number;
   /** Host path the finished video will land at once stop is called. */
   outputFile: string;
+  /**
+   * Foldable iOS simulators only: the panel the device renders to could not
+   * be resolved, so the recording started on the cover panel. Says why and
+   * what to check.
+   */
+  warning?: string;
 }
 
 export interface StopRecordingFile {
@@ -25,6 +54,11 @@ export interface StopRecordingFile {
   wallClockMs?: number;
   /** How much wall-clock time trimming removed. Present only when trimming applied. */
   trimmedMs?: number;
+  /**
+   * Foldables only, and only when it happened: how many times the capture
+   * moved to the other panel because the device was folded or unfolded.
+   */
+  panelSwitches?: number;
   warning?: string;
 }
 
@@ -141,9 +175,10 @@ export function assertNotDisposed(api: ScreenRecordingSessionApi, stage: string)
   if (api.disposed) {
     throw new FailureError(
       `The screen-recording session for device ${api.deviceId} was torn down while this start ` +
-        `was still initializing, so nothing was recorded. That is either the tool-server shutting ` +
-        `down or a stop-all-simulator-servers reaping this device (e.g. another agent ending its ` +
-        `session). If the device is still up, start the recording again.`,
+        `was still initializing, so nothing was recorded. That is the tool-server shutting down, ` +
+        `a stop-all-simulator-servers reaping this device, or a stop-simulator-server on a Mac ` +
+        `app (e.g. another agent ending its session). If the device is still up, start the ` +
+        `recording again.`,
       {
         error_code: FAILURE_CODES.SCREEN_RECORDING_SERVER_SHUTTING_DOWN,
         failure_stage: stage,

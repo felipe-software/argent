@@ -8,6 +8,10 @@ const path = require("path");
 const WORKSPACE_ROOT = path.resolve(__dirname, "../../..");
 
 const TOOLS_ENTRY = path.resolve(WORKSPACE_ROOT, "packages/tool-server/src/index.ts");
+const DEVICE_PROVIDERS_ENTRY = path.resolve(
+  WORKSPACE_ROOT,
+  "packages/device-providers/src/index.ts"
+);
 const ARCHIVE_ENTRY = path.resolve(WORKSPACE_ROOT, "packages/archive/src/index.ts");
 const REGISTRY_ENTRY = path.resolve(WORKSPACE_ROOT, "packages/registry/src/index.ts");
 const TELEMETRY_ENTRY = path.resolve(WORKSPACE_ROOT, "packages/telemetry/src/index.ts");
@@ -35,6 +39,10 @@ const OUT_FILE = path.resolve(__dirname, "../dist/tool-server.cjs");
 const INSTALLER_OUT_FILE = path.resolve(__dirname, "../dist/installer.mjs");
 const MCP_OUT_FILE = path.resolve(__dirname, "../dist/mcp-server.mjs");
 const CLI_OUT_FILE = path.resolve(__dirname, "../dist/cli-cmds.mjs");
+// Bundled over tsc's emit of src/client.ts, which imports private workspace
+// packages; tsc's client.d.ts is kept as the public types.
+const CLIENT_ENTRY = path.resolve(__dirname, "../src/client.ts");
+const CLIENT_OUT_FILE = path.resolve(__dirname, "../dist/client.js");
 const PREVIEW_WINDOW_OUT_FILE = path.resolve(__dirname, "../dist/preview-window/main.cjs");
 
 // Resolve workspace deps from source rather than each package's compiled dist/,
@@ -50,6 +58,7 @@ const ALIASES = {
   "@argent/cli": CLI_ENTRY,
   "@argent/configuration-core": CONFIGURATION_ENTRY,
   "@argent/telemetry": TELEMETRY_ENTRY,
+  "@argent/device-providers": DEVICE_PROVIDERS_ENTRY,
 };
 
 // Build-time constants for @argent/telemetry. An unset ARGENT_OTEL_INGEST_TOKEN
@@ -69,6 +78,11 @@ const TELEMETRY_OTEL_INGEST_TOKEN = process.env.ARGENT_OTEL_INGEST_TOKEN ?? "";
 const TELEMETRY_DEFINE = {
   ARGENT_CLI_VERSION: JSON.stringify(TELEMETRY_CLI_VERSION),
   ARGENT_OTEL_INGEST_TOKEN: JSON.stringify(TELEMETRY_OTEL_INGEST_TOKEN),
+};
+
+const BUILD_DEFINE = {
+  ...TELEMETRY_DEFINE,
+  ARGENT_RELEASE_BUILD: JSON.stringify(process.env.ARGENT_RELEASE_BUILD === "1"),
 };
 
 // Prefer "module" over esbuild's node default ["main","module"]: UMD entries
@@ -152,6 +166,46 @@ const TRACECFG_SRC = path.resolve(
   "packages/native-devtools-android/assets/argent.tracecfg.pbtxt"
 );
 const TRACECFG_DEST = path.resolve(__dirname, "../assets/argent.tracecfg.pbtxt");
+// Nothing imports these, so esbuild cannot bundle them. The executor resolves
+// the runner from its own `__dirname` and the runner resolves both watchdogs
+// from its module URL, so all three must land flat beside tool-server.cjs.
+const FLOW_SCRIPT_SRC_DIR = path.resolve(
+  WORKSPACE_ROOT,
+  "packages/tool-server/src/tools/flows/script"
+);
+const FLOW_SCRIPT_FILES = [
+  "flow-script-runner.mjs",
+  "flow-script-watchdog-lifeline.mjs",
+  "flow-script-watchdog-deadline.mjs",
+];
+// The cabled-iPhone screen-capture helper ships as source: the tool-server
+// compiles it with `xcrun swiftc` on first use. It resolves the sources at
+// `<pkg>/assets/ios-screen-stream/` from its bundled `__dirname`.
+const IOS_SCREEN_STREAM_SRC = path.resolve(
+  WORKSPACE_ROOT,
+  "packages/tool-server/src/tools/screen-recording/ios-device-stream"
+);
+const IOS_SCREEN_STREAM_DEST = path.resolve(__dirname, "../assets/ios-screen-stream");
+const IOS_RUNNER_SRC = path.resolve(WORKSPACE_ROOT, "packages/ios-device-runner/ArgentRunner");
+const IOS_RUNNER_DEST = path.resolve(__dirname, "../dist/ios-device-runner/ArgentRunner");
+// Local state that must never ship: per-user schemes/breakpoints, Xcode and
+// SwiftPM build output (`build` and `Build` are what a Legacy or a Custom,
+// relative to workspace build location leaves next to the project) and Finder
+// metadata. Everything else in the project tree is source the user-side
+// xcodebuild needs.
+//
+// Same names as FINGERPRINT_NOISE in tool-server's runner-artifact.ts, which
+// keeps them out of the runner's cache key: what is not hashed must not ship.
+// package-manifest.test.ts holds the two lists equal.
+const IOS_RUNNER_SKIP_NAMES = new Set([
+  "xcuserdata",
+  "DerivedData",
+  "build",
+  "Build",
+  ".build",
+  ".swiftpm",
+  ".DS_Store",
+]);
 
 // Declarative copy plan for copyAsset() below.
 //
@@ -176,6 +230,8 @@ const TRACECFG_DEST = path.resolve(__dirname, "../assets/argent.tracecfg.pbtxt")
  * @property {string} [countExt]
  * @property {(src: string) => number} [count]
  * @property {string} [hint]
+ * @property {(src: string) => boolean} [filter] dir-only: cpSync filter, false skips the entry
+ * @property {boolean} [clean] dir-only: rm the dest first, so a re-bundle never merges stale files
  */
 /** @type {Asset[]} */
 const ASSETS = [
@@ -221,8 +277,19 @@ const ASSETS = [
     copiedLabel: "tvos-hid-daemon binary",
     missLabel: "tvos-hid-daemon binary",
   },
+  // argent-macos-helper, the host binary that starts a native Mac app. The two
+  // macOS dylibs ship in dylibs/macos/ with the recursive dylibs/ copy.
+  {
+    kind: "file",
+    src: path.resolve(BIN_SRC_ROOT, "darwin/argent-macos-helper"),
+    dest: path.resolve(BIN_DIR, "darwin/argent-macos-helper"),
+    mode: 0o755,
+    required: false,
+    copiedLabel: "argent-macos-helper binary",
+    missLabel: "argent-macos-helper binary",
+  },
   // Android host-side Perfetto trace processor: the third-party WASM engine
-  // (trace_processor.wasm + emscripten glue + engine.mjs decoder + LICENSE).
+  // (trace_processor.wasm + emscripten glue + LICENSE).
   // wasm-trace-processor.ts resolves them at `<pkg>/assets/trace-processor/`,
   // i.e. this exact destination. Not committed; fetched + sha256-verified by
   // scripts/download-trace-processor.sh.
@@ -233,6 +300,9 @@ const ASSETS = [
     required: true,
     copiedLabel: "trace-processor WASM asset(s)",
     missLabel: "trace-processor WASM assets directory",
+    // A checkout downloaded before argent had its own RPC client still holds
+    // the old engine.mjs decoder; never ship it.
+    filter: (src) => path.basename(src) !== "engine.mjs",
     hint: "Run: bash scripts/download-trace-processor.sh (fetches from argent-private-releases)",
   },
   // iOS native devtools dylibs so the packaged tool-server can inject them at runtime.
@@ -244,6 +314,26 @@ const ASSETS = [
     copiedLabel: "native dylib(s)",
     missLabel: "Native devtools dylibs",
     countExt: ".dylib",
+  },
+  // The physical-iOS runner's Xcode project, SOURCES not binaries: the runner
+  // must be signed with each user's own Apple team on each user's own Mac
+  // (a development profile whitelists device UDIDs, so no prebuilt can exist),
+  // and runner-artifact.ts resolves this exact dest relative to the bundled
+  // tool-server. Cleaned first so a re-bundle never merges a stale tree.
+  {
+    kind: "dir",
+    src: IOS_RUNNER_SRC,
+    dest: IOS_RUNNER_DEST,
+    required: true,
+    clean: true,
+    filter: (src) => !IOS_RUNNER_SKIP_NAMES.has(path.basename(src)),
+    copiedLabel: "iOS device-runner source file(s)",
+    missLabel: "iOS device-runner Xcode project",
+    // countExt reads one directory level; the Swift files sit two deep.
+    count: (src) =>
+      fs
+        .readdirSync(src, { recursive: true })
+        .filter((f) => typeof f === "string" && f.endsWith(".swift")).length,
   },
   // Android helper manifest.json: helperManifest()/bundledHelperApkPath() read it
   // at runtime, and the version-stamped APK filename comes from its versionName
@@ -284,6 +374,18 @@ const ASSETS = [
     required: false,
     copiedLabel: "Argent.tracetemplate",
     missLabel: "Argent.tracetemplate",
+  },
+  {
+    kind: "dir",
+    src: IOS_SCREEN_STREAM_SRC,
+    dest: IOS_SCREEN_STREAM_DEST,
+    clean: true,
+    required: true,
+    copiedLabel: "iPhone screen-capture helper source",
+    missLabel: "iPhone screen-capture helper source",
+    // The TypeScript beside it is bundled into tool-server.cjs.
+    filter: (src) => !src.endsWith(".ts"),
+    hint: "screen-recording-start needs it to record a cabled iPhone.",
   },
   // Android profiler capture reads this via @argent/native-devtools-android's
   // `traceConfigPath()`, which resolves `<pkg>/assets/argent.tracecfg.pbtxt` —
@@ -343,6 +445,18 @@ const ASSETS = [
         .readdirSync(src, { withFileTypes: true })
         .filter((e) => e.isFile() && e.name.endsWith(".md")).length,
   },
+  ...FLOW_SCRIPT_FILES.map(
+    (name) =>
+      /** @type {Asset} */ ({
+        kind: "file",
+        src: path.join(FLOW_SCRIPT_SRC_DIR, name),
+        dest: path.resolve(__dirname, "../dist", name),
+        required: true,
+        copiedLabel: name,
+        missLabel: name,
+        hint: "This file is required for e2e test `script` steps.",
+      })
+  ),
 ];
 
 /**
@@ -358,7 +472,7 @@ function buildBundle({ entry, out, format, label, external = [] }) {
     outfile: out,
     alias: ALIASES,
     mainFields: MAIN_FIELDS,
-    define: TELEMETRY_DEFINE,
+    define: BUILD_DEFINE,
     // ESM bundles need the require() shim and must keep node: builtins external;
     // CJS bundles externalise only what the caller passes.
     ...(format === "esm"
@@ -398,7 +512,8 @@ function copyAsset(a) {
   }
 
   if (a.kind === "dir") {
-    fs.cpSync(a.src, a.dest, { recursive: true });
+    if (a.clean) fs.rmSync(a.dest, { recursive: true, force: true });
+    fs.cpSync(a.src, a.dest, { recursive: true, filter: a.filter });
   } else {
     fs.mkdirSync(path.dirname(a.dest), { recursive: true });
     fs.copyFileSync(a.src, a.dest);
@@ -452,6 +567,23 @@ export const PERFETTO_VERSION = "${version}";
   console.log(`✓ Generated bundled-meta.ts (perfetto=${version})`);
 }
 
+/** The bundles dist/cli.js lazy-imports for its subcommands. */
+const DISPATCHER_ESM_BUNDLES = [
+  { entry: INSTALLER_ENTRY, out: INSTALLER_OUT_FILE, label: "installer" },
+  { entry: MCP_ENTRY, out: MCP_OUT_FILE, label: "MCP server" },
+  // node-pty is a native addon `argent lens` loads at runtime (the agent PTY
+  // proxy); esbuild can't inline a .node. Absent install → loadNodePty() returns
+  // null → lens falls back to a new terminal window.
+  { entry: CLI_ENTRY, out: CLI_OUT_FILE, label: "CLI commands", external: ["node-pty"] },
+];
+
+if (process.argv.includes("--esm-only")) {
+  for (const b of DISPATCHER_ESM_BUNDLES) {
+    buildBundle({ ...b, format: "esm" });
+  }
+  process.exit(0);
+}
+
 // Must run before esbuild, so PERFETTO_VERSION is inlined into the bundles.
 generateBundledMeta();
 
@@ -500,6 +632,13 @@ fs.mkdirSync(path.dirname(OUT_FILE), { recursive: true });
 // back to a literal and then chokes on dtrace-provider's own dynamic native
 // binding require. External restores bunyan's intent: the published package
 // never declares it, so the require misses and bunyan nulls it out.
+//
+// `sharp` is the optional Chromium screenshot post-processor: the tool-server
+// `require("sharp")`s it inside a try/catch and skips scale / rotation when it
+// is absent. It is never declared here, so in CI esbuild leaves the require
+// alone — but a developer with sharp in node_modules (e.g. installed to test
+// that path) would have the bundle inline its native addon and fail. External
+// keeps the runtime require resolving against whatever the user installed.
 buildBundle({
   entry: TOOLS_ENTRY,
   out: OUT_FILE,
@@ -512,6 +651,7 @@ buildBundle({
     "@fails-components/webtransport",
     "@fails-components/webtransport-transport-http3-quiche",
     "dtrace-provider",
+    "sharp",
   ],
 });
 
@@ -520,15 +660,18 @@ buildBundle({
 //     lazy-imports it, so its workspace dep needn't resolve in the published pkg);
 //   - MCP server: the @modelcontextprotocol/sdk ESM export paths resolve.
 const ESM_BUNDLES = [
-  { entry: INSTALLER_ENTRY, out: INSTALLER_OUT_FILE, label: "installer" },
-  { entry: MCP_ENTRY, out: MCP_OUT_FILE, label: "MCP server" },
-  // node-pty is a native addon `argent lens` loads at runtime (the agent PTY
-  // proxy); esbuild can't inline a .node. Absent install → loadNodePty() returns
-  // null → lens falls back to a new terminal window.
-  { entry: CLI_ENTRY, out: CLI_OUT_FILE, label: "CLI commands", external: ["node-pty"] },
+  ...DISPATCHER_ESM_BUNDLES,
+  // `@swmansion/argent/client`, the programmatic tool-server client.
+  { entry: CLIENT_ENTRY, out: CLIENT_OUT_FILE, label: "client" },
 ];
 for (const b of ESM_BUNDLES) {
   buildBundle({ ...b, format: "esm" });
+}
+// tsc's map describes its own client.js, which the bundle above replaced. The
+// generated tool args are types only, so only their .d.ts ships.
+fs.rmSync(`${CLIENT_OUT_FILE}.map`, { force: true });
+for (const ext of [".js", ".js.map"]) {
+  fs.rmSync(path.join(path.dirname(CLIENT_OUT_FILE), `tool-args.generated${ext}`), { force: true });
 }
 
 for (const a of ASSETS) {
@@ -550,7 +693,7 @@ buildBundle({
 });
 
 // Require the darwin binary only when bundling ON darwin (the publish pipeline):
-// a Linux contributor running `npm run pack` can't produce the macOS binary, so
+// a Linux contributor running `bun run pack` can't produce the macOS binary, so
 // don't block them on its absence.
 for (const platform of SUPPORTED_HOST_PLATFORMS) {
   const binaryFile = simulatorServerFileName(platform);
@@ -586,10 +729,10 @@ if (fs.existsSync(RESOURCES_SRC)) {
   console.warn(`⚠ screen-sharing agent resources not found at ${RESOURCES_SRC} — skipping`);
 }
 
-// The Android helper APK is the only Android native artifact left (the trace
-// processor ships as WASM under assets/trace-processor/). Its filename is
-// version-stamped from manifest.json's versionName (see bundledHelperApkPath());
-// it is required at runtime, so a missing one throws.
+// The Android helper APK's filename is version-stamped from manifest.json's
+// versionName (see bundledHelperApkPath()); it is required at runtime, so a
+// missing one throws. (The trace processor ships as WASM under
+// assets/trace-processor/.)
 const manifest = JSON.parse(fs.readFileSync(ANDROID_MANIFEST_SRC, "utf8"));
 const apkName = `argent-android-devtools-${manifest.versionName}.apk`;
 const apkSrc = path.join(ANDROID_APK_SRC_DIR, apkName);
@@ -602,4 +745,18 @@ if (fs.existsSync(apkSrc)) {
       `Run: bash scripts/download-native-binaries.sh (fetches from argent-private-releases)\n` +
       `or: bash packages/native-devtools-android/scripts/build.sh`
   );
+}
+
+// The network inspector agent is optional at runtime: without it,
+// network-capture-start reports the Android native layer as unavailable. So a
+// local build without it only warns; publish-npm.yml fails a release that
+// lacks it.
+const NETWORK_INSPECTOR_SRC = path.join(ANDROID_APK_SRC_DIR, "network-inspector");
+if (fs.existsSync(NETWORK_INSPECTOR_SRC)) {
+  fs.cpSync(NETWORK_INSPECTOR_SRC, path.join(BIN_DIR, "network-inspector"), { recursive: true });
+  console.log(
+    `✓ Copied network inspector agent → ${path.relative(process.cwd(), BIN_DIR)}/network-inspector`
+  );
+} else {
+  console.warn(`⚠ network inspector agent not found at ${NETWORK_INSPECTOR_SRC} — skipping`);
 }

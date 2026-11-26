@@ -180,6 +180,25 @@ describe("argent config — set/get across scopes", () => {
     );
     expect(globalCfg).toEqual({ lens: { agent: "codex" } });
   });
+
+  describe.skipIf(process.platform === "win32")("with HOME reached through a symlink", () => {
+    it.each([".argent", ".git"])(
+      "warns when project scope resolves to the home directory (%s marker)",
+      (marker) => {
+        const linkedHome = path.join(projectDir, "home");
+        fs.symlinkSync(homeDir, linkedHome);
+        process.env.HOME = linkedHome;
+        fs.mkdirSync(path.join(homeDir, marker));
+        const nested = path.join(homeDir, "not-a-project");
+        fs.mkdirSync(nested);
+        process.chdir(nested);
+
+        config(["set", "lens.agent", "codex", "--scope", "project"]);
+
+        expect(errors()).toContain("resolved to the home directory");
+      }
+    );
+  });
 });
 
 describe("argent config — validation & errors", () => {
@@ -199,10 +218,42 @@ describe("argent config — validation & errors", () => {
     expect(errors()).toMatch(/--scope must be/);
   });
 
+  it.each([
+    [["list", "--jsno"], "Unknown flag: --jsno"],
+    [["list", "extra"], 'unexpected extra argument "extra"'],
+    [["list", "--scope", "project"], "Unknown flag: --scope"],
+  ])("rejects %j with exit 2 instead of listing", (argv, message) => {
+    expect(() => config(argv)).toThrow(new ExitError(2));
+    expect(errors()).toContain(message);
+    expect(output()).toBe("");
+  });
+
+  it.each([[["set", "lens.agent", "claude", "--json"]], [["unset", "lens.agent", "--json"]]])(
+    "rejects --json on %j, which has no JSON output",
+    (argv) => {
+      expect(() => config(argv)).toThrow(new ExitError(2));
+      expect(errors()).toContain("Unknown flag: --json");
+      expect(output()).toBe("");
+    }
+  );
+
   it("rejects a value that fails the schema validator", () => {
     // lens.agent must be a non-blank string; a JSON number is invalid.
     expect(() => config(["set", "lens.agent", "42"])).toThrow(ExitError);
     expect(errors()).toMatch(/Invalid value/);
+  });
+});
+
+describe("argent config — usage", () => {
+  it("wraps every recognized key's description within 80 columns", () => {
+    config(["--help"]);
+    const out = output();
+    expect(out).toContain("Recognized keys:");
+    expect(out).toContain("\n  telemetry.enabled\n      Whether anonymous");
+    for (const line of out.split("\n")) {
+      // eslint-disable-next-line no-control-regex
+      expect(line.replace(/\x1b\[[0-9;]*m/g, "").length).toBeLessThanOrEqual(80);
+    }
   });
 });
 
@@ -227,6 +278,18 @@ describe("argent config — list & json", () => {
     const parsed = JSON.parse(output());
     const telemetry = parsed.config.find((e: { key: string }) => e.key === "telemetry.enabled");
     expect(telemetry.effective).toBe(true);
+  });
+
+  it("disables automatic updates through the boolean config command", () => {
+    config(["set", "autoUpdate.enabled", "false"]);
+    logSpy.mockClear();
+    config(["get", "autoUpdate.enabled"]);
+    expect(output()).toBe("false");
+
+    const globalCfg = JSON.parse(
+      fs.readFileSync(path.join(homeDir, ".argent", "config.json"), "utf8")
+    );
+    expect(globalCfg).toEqual({ autoUpdate: { enabled: false } });
   });
 
   it("get --json emits a structured record", () => {
@@ -325,5 +388,32 @@ describe("argent config — unset leaves no empty parent behind", () => {
     config(["unset", "ios.additionalDeviceSets", "--scope", "project"]);
 
     expect(fs.readFileSync(file, "utf8")).toBe('{"ios":{}}');
+  });
+});
+
+describe("argent config — a key the tool-server reads only at start", () => {
+  it("says a set or unset of android.adbServerPort needs a tool-server restart", () => {
+    config(["set", "android.adbServerPort", "5038"]);
+    expect(errors()).toContain("only when it starts");
+    expect(errors()).toContain("argent server stop");
+
+    errSpy.mockClear();
+    config(["unset", "android.adbServerPort"]);
+    expect(errors()).toContain("argent server stop");
+  });
+
+  it("says nothing when the write did not happen", () => {
+    expect(() => config(["set", "android.adbServerPort", "0"])).toThrow(ExitError);
+    expect(errors()).not.toContain("argent server stop");
+
+    errSpy.mockClear();
+    config(["unset", "android.adbServerPort"]);
+    expect(errors()).toBe("");
+  });
+
+  it("says nothing for a key that applies without a restart", () => {
+    config(["set", "android.sdkRoot", "/opt/android-sdk"]);
+    config(["unset", "android.sdkRoot"]);
+    expect(errors()).toBe("");
   });
 });

@@ -1,15 +1,15 @@
 import { z } from "zod";
-import type { DeviceInfo, Registry } from "@argent/registry";
-import type { DescribeFrame, DescribeNode, DescribeTreeData } from "../tools/describe/contract";
-import { describeIos } from "../tools/describe/platforms/ios";
-import { describeAndroid } from "../tools/describe/platforms/android";
-import { describeChromium } from "../tools/describe/platforms/chromium";
-import { describeVega } from "../tools/describe/platforms/vega";
-import { chromiumCdpRef, type ChromiumCdpApi } from "../blueprints/chromium-cdp";
+import type { DescribeFrame, DescribeNode } from "../tools/describe/contract";
 
 /**
  * Shared tree matching: `await-ui-element`, the flow directives (`tap`, `type`,
  * `assert`) and the recorder's reverse lookup all resolve selectors through it.
+ *
+ * Reading order — what `after` and `next` mean by "follows", the match a
+ * `text` condition reads first, the pick of an `any: true` selector — is the
+ * user's, and so is every tree's frame space: an iOS simulator's trees are
+ * turned into the UI's upright space before they get here, also on a landscape
+ * UI (`utils/ios-ui-orientation.ts`).
  */
 
 /**
@@ -233,7 +233,7 @@ export function matchNode(node: DescribeNode, selector: Selector): boolean {
 const WITHIN_EPS = 0.005;
 
 /** Is `inner` contained in `outer`, within {@link WITHIN_EPS} per edge? */
-function frameWithin(inner: DescribeFrame, outer: DescribeFrame): boolean {
+export function frameWithin(inner: DescribeFrame, outer: DescribeFrame): boolean {
   return (
     inner.x >= outer.x - WITHIN_EPS &&
     inner.y >= outer.y - WITHIN_EPS &&
@@ -479,20 +479,65 @@ export function isVisible(node: DescribeNode): boolean {
   return node.frame.width > 0 && node.frame.height > 0;
 }
 
-// The element a reader "sees first": smallest (y, then x), matching the order
-// format-tree renders flat iOS leaves in.
+// The nodes of the frontmost `layer` among `nodes`: a match in a Mac app's open
+// menu or sheet is the one in front of a same-named control of the window.
+function frontmost(nodes: DescribeNode[]): DescribeNode[] {
+  let top = 0;
+  for (const n of nodes) top = Math.max(top, n.layer ?? 0);
+  return top === 0 ? nodes : nodes.filter((n) => n.layer === top);
+}
+
+// The element a reader "sees first": in the frontmost layer, smallest (y, then
+// x), matching the order format-tree renders flat iOS leaves in.
 export function firstInReadingOrder(matches: DescribeNode[]): DescribeNode | undefined {
   let best: DescribeNode | undefined;
-  for (const n of matches) {
+  let bestFrame: DescribeFrame | undefined;
+  for (const n of frontmost(matches)) {
+    const f = n.frame;
     if (
-      best === undefined ||
-      n.frame.y < best.frame.y ||
-      (n.frame.y === best.frame.y && n.frame.x < best.frame.x)
+      bestFrame === undefined ||
+      f.y < bestFrame.y ||
+      (f.y === bestFrame.y && f.x < bestFrame.x)
     ) {
       best = n;
+      bestFrame = f;
     }
   }
   return best;
+}
+
+const MAC_TEXT_FIELD_ROLES: ReadonlySet<string> = new Set([
+  "AXTextField",
+  "AXTextArea",
+  "AXComboBox",
+]);
+
+// The text a `text` check reads off a Mac app's text field: only its value, ""
+// when it is empty, also when its placeholder is its label. Undefined for any
+// other element, and for a password field, whose text argent never reads.
+export function macFieldText(node: DescribeNode, macos: boolean): string | undefined {
+  return macos && MAC_TEXT_FIELD_ROLES.has(node.role) && !node.password
+    ? (node.value ?? "")
+    : undefined;
+}
+
+const MAC_TEXT_ROLES: ReadonlySet<string> = new Set(["AXStaticText", "AXHeading", "AXLink"]);
+
+// The match a `text` check reads: the first visible one in reading order (the
+// first overall if none is visible). On a Mac app, not a text area around a
+// matching text: a web editor's value is the text of the paragraphs inside it,
+// so a selector for a paragraph's text reads that paragraph.
+export function textCheckTarget(matches: DescribeNode[], macos: boolean): DescribeNode | undefined {
+  const read = macos
+    ? matches.filter(
+        (n) =>
+          n.role !== "AXTextArea" ||
+          !matches.some(
+            (m) => isVisible(m) && MAC_TEXT_ROLES.has(m.role) && frameWithin(m.frame, n.frame)
+          )
+      )
+    : matches;
+  return firstInReadingOrder(read.filter(isVisible)) ?? firstInReadingOrder(read);
 }
 
 // Evaluated over ALL elements matching a selector. `visible` holds if ANY match
@@ -505,7 +550,8 @@ export function evaluateCondition(
   condition: WaitCondition,
   expectedText: string | undefined,
   matches: DescribeNode[],
-  textMatch: TextMatchMode = "contains"
+  textMatch: TextMatchMode = "contains",
+  textFieldsShowText = false
 ): boolean {
   switch (condition) {
     case "exists":
@@ -515,8 +561,29 @@ export function evaluateCondition(
     case "hidden":
       return !matches.some(isVisible);
     case "text": {
-      const first = firstInReadingOrder(matches.filter(isVisible)) ?? firstInReadingOrder(matches);
+      const first = textCheckTarget(matches, textFieldsShowText);
       if (first === undefined || expectedText === undefined) return false;
+      const field = macFieldText(first, textFieldsShowText);
+      if (field !== undefined) {
+        return textMatch === "matches"
+          ? uiTreeMatchInternals.createRegExp(expectedText).test(field)
+          : textMatches(field, expectedText, textMatch);
+      }
+      // An element with no text at all reads as "", so `matches: '^$'` or a
+      // negative lookahead can check an empty field. Selector matching still
+      // skips empty text, or `.*` would select every unlabeled view. Not an
+      // iOS text field: a secure field's text is never read, so a filled one
+      // reads "" there (an empty field reads its placeholder). Nor a Mac app's
+      // password field, whose text argent never reads.
+      if (
+        textMatch === "matches" &&
+        (textFieldsShowText ? !first.password : first.role !== "AXTextField") &&
+        !assertText(first) &&
+        !nodeText(first) &&
+        uiTreeMatchInternals.createRegExp(expectedText).test("")
+      ) {
+        return true;
+      }
       // Hoisted subtree text is ADDITIVE: a check the element's own
       // label/value satisfies on a plain describe tree must not start failing
       // because the flow adapters stamped a compound `subtreeText` on the node.
@@ -572,9 +639,9 @@ function frameArea(frame: DescribeFrame): number {
 }
 
 /**
- * Reverse lookup for recording: the smallest visible node whose frame contains
- * the tapped point — the most specific element (a button over its container).
- * Skips the synthetic root.
+ * Reverse lookup for recording: the smallest visible node of the frontmost
+ * layer whose frame contains the tapped point: the most specific element (a
+ * button over its container). Skips the synthetic root.
  */
 export function nodeAtPoint(
   root: DescribeNode,
@@ -583,7 +650,14 @@ export function nodeAtPoint(
   let best: DescribeNode | undefined;
   const walk = (node: DescribeNode): void => {
     if (isVisible(node) && frameContains(node.frame, point.x, point.y)) {
-      if (best === undefined || frameArea(node.frame) < frameArea(best.frame)) best = node;
+      const layerDelta = (node.layer ?? 0) - (best?.layer ?? 0);
+      if (
+        best === undefined ||
+        layerDelta > 0 ||
+        (layerDelta === 0 && frameArea(node.frame) < frameArea(best.frame))
+      ) {
+        best = node;
+      }
     }
     for (const child of node.children) walk(child);
   };
@@ -628,13 +702,14 @@ function exactFieldCount(
 }
 
 /**
- * The on-screen frame of a selector's best visible match — what a `tap`/`type`
- * action targets. An accessible container (e.g. a Touchable on iOS) aggregates
+ * The best visible match of a selector — the element a `tap`/`type` action
+ * targets. An accessible container (e.g. a Touchable on iOS) aggregates
  * its descendants' labels, so a substring text selector matches the container
  * as well as the leaf carrying the text, and the container's centre can sit
  * over a different child entirely. Matches are therefore ranked: exact field
  * matches beat substring hits, then the smallest frame (mirroring
- * {@link nodeAtPoint}), with reading order as the final tiebreak.
+ * {@link nodeAtPoint}), with reading order as the final tiebreak. Only the
+ * matches of the frontmost layer take part.
  *
  * The universal selector (flow YAML's `any: true`) is the case ranking cannot
  * serve: with no field to be exact about, "smallest" degenerates to whatever
@@ -647,15 +722,15 @@ function exactFieldCount(
  * emission order, and two frames with different extents are two different tap
  * centres, so the tie continues into "most specific" instead.
  */
-export function selectorToFrame(root: DescribeNode, selector: Selector): DescribeFrame | undefined {
-  const visible = findAll(root, selector).filter(isVisible);
+export function selectorToNode(root: DescribeNode, selector: Selector): DescribeNode | undefined {
+  const visible = frontmost(findAll(root, selector).filter(isVisible));
   if (visible.length === 0) return undefined;
   if (!hasOwnConstraint(selector)) {
     let first: DescribeNode | undefined;
     for (const n of visible) {
       if (first === undefined || compareBelowPick(n.frame, first.frame) < 0) first = n;
     }
-    return first?.frame;
+    return first;
   }
   const fullTextRegex = fullConsumptionRegex(selector);
   let best: DescribeNode | undefined;
@@ -670,15 +745,18 @@ export function selectorToFrame(root: DescribeNode, selector: Selector): Describ
       continue;
     }
     const areaDelta = frameArea(n.frame) - frameArea(best.frame);
-    if (
-      areaDelta < 0 ||
-      (areaDelta === 0 &&
-        (n.frame.y < best.frame.y || (n.frame.y === best.frame.y && n.frame.x < best.frame.x)))
-    ) {
+    const nf = n.frame;
+    const bf = best.frame;
+    if (areaDelta < 0 || (areaDelta === 0 && (nf.y < bf.y || (nf.y === bf.y && nf.x < bf.x)))) {
       best = n;
     }
   }
-  return best?.frame;
+  return best;
+}
+
+/** The frame of {@link selectorToNode}'s match. */
+export function selectorToFrame(root: DescribeNode, selector: Selector): DescribeFrame | undefined {
+  return selectorToNode(root, selector)?.frame;
 }
 
 const GENERIC_ROLES = new Set([
@@ -711,31 +789,4 @@ export function deriveSelector(node: DescribeNode): Selector | null {
   if (text) return { text };
   if (node.role && !GENERIC_ROLES.has(node.role.toLowerCase())) return { role: node.role };
   return null;
-}
-
-/**
- * Fetch the describe tree for a device. The chromium CDP session is the only
- * service resolved here — iOS / Android describe resolve their own internally,
- * and Vega reads the on-device automation toolkit's page source.
- */
-export async function fetchTree(
-  registry: Registry,
-  device: DeviceInfo,
-  opts: { bundleId?: string } = {}
-): Promise<DescribeTreeData> {
-  if (device.platform === "ios") {
-    return describeIos(registry, device, { bundleId: opts.bundleId });
-  }
-  if (device.platform === "android") {
-    return describeAndroid(registry, device.id);
-  }
-  if (device.platform === "chromium") {
-    const ref = chromiumCdpRef(device);
-    const api = await registry.resolveService<ChromiumCdpApi>(ref.urn, ref.options);
-    return describeChromium(api);
-  }
-  if (device.platform === "vega") {
-    return describeVega(device.id);
-  }
-  throw new Error(`ui-tree matching is not supported on platform "${device.platform}"`);
 }

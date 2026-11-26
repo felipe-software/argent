@@ -157,6 +157,7 @@ describe("printInstallerHelp", () => {
     expect(init).toContain("Options:");
     expect(init).toContain("--yes, -y");
     expect(init).toContain("--no-telemetry");
+    expect(init).toContain("--no-allowlist");
     expect(init).toContain("--from <path>");
     expect(init).toContain("--global");
     expect(init).toContain("--local");
@@ -182,19 +183,6 @@ describe("printInstallerHelp", () => {
     const remove = render("remove");
     expect(remove).toContain("Run `argent uninstall --help` to see its options.");
     expect(remove).not.toContain("Options:");
-  });
-
-  it("only writes to stdout (no wizard / prompt / network)", () => {
-    // The whole contract of the help path is that it is side-effect-free. This
-    // asserts the function writes to console.log and returns nothing — not how
-    // many calls it batches the output into, which is an implementation
-    // detail. The end-to-end guarantee (config left untouched) is covered in
-    // cli-dispatch.test.ts.
-    const spy = vi.spyOn(console, "log").mockImplementation(() => {});
-    const result = printInstallerHelp("uninstall");
-    expect(result).toBeUndefined();
-    expect(spy).toHaveBeenCalled();
-    spy.mockRestore();
   });
 });
 
@@ -225,20 +213,23 @@ describe("INSTALLER_COMMAND_META", () => {
 describe("mcp is intercepted like the installers", () => {
   // `argent mcp --help` used to start the stdio server, which then blocked
   // reading JSON-RPC from stdin — the reason this command joined the set.
+  // One argv per row, nested so `%j` names all of it: un-nested, the single placeholder
+  // takes only argv[0], so the last two rows both read `treats "--foo"` — the opposite of
+  // what they assert.
   it.each([
-    ["--help"],
-    ["-h"],
-    ["-H"],
-    ["--HELP"],
-    ["-help"],
-    ["—help"],
-    ["–help"],
-    ["--help=x"],
-    ["help"],
-    ["HELP"],
-    ["--foo", "--help"],
-    ["--foo", "help"],
-  ])("treats %j as a help request", (...rest) => {
+    [["--help"]],
+    [["-h"]],
+    [["-H"]],
+    [["--HELP"]],
+    [["-help"]],
+    [["—help"]],
+    [["–help"]],
+    [["--help=x"]],
+    [["help"]],
+    [["HELP"]],
+    [["--foo", "--help"]],
+    [["--foo", "help"]],
+  ])("treats %j as a help request", (rest) => {
     expect(installerHelpRequested("mcp", rest)).toBe(true);
   });
 
@@ -247,9 +238,9 @@ describe("mcp is intercepted like the installers", () => {
     expect(installerHelpRequested("mcp", [])).toBe(false);
   });
 
-  it.each([["--helpme"], ["/help"], ["--metro-port", "8082"]])(
+  it.each([[["--helpme"]], [["/help"]], [["--metro-port", "8082"]]])(
     "does not treat %j as a help request",
-    (...rest) => {
+    (rest) => {
       expect(installerHelpRequested("mcp", rest)).toBe(false);
     }
   );

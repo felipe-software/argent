@@ -5,6 +5,8 @@ import type { ToolDefinition } from "@argent/registry";
 import { RN_ONLY_TOOL_CAPABILITY } from "./debugger-service-ref";
 import type { JsRuntimeDebuggerApi } from "../../blueprints/js-runtime-debugger";
 import { makeComponentTreeScript } from "../../utils/debugger/scripts/component-tree";
+import { metroPort, metroPortField } from "../../utils/debugger/metro-port";
+import { MACOS_APP_ID_PREFIX } from "../../utils/device-info";
 
 export interface RawEntry {
   id: number;
@@ -39,7 +41,11 @@ function rectsOverlap(
 
 export function buildTextTree(
   data: RawResult,
-  opts: { onScreenOnly: boolean; maxNodes?: number; includeSkipped?: boolean }
+  opts: {
+    onScreenOnly: boolean;
+    maxNodes?: number;
+    includeSkipped?: boolean;
+  }
 ): string {
   const { screenW, screenH, components } = data;
 
@@ -331,10 +337,7 @@ export function buildTextTree(
 
   const lines: string[] = [];
 
-  if (canNormalize) {
-    lines.push(`Screen: ${screenW}x${screenH}`);
-    lines.push("");
-  }
+  if (canNormalize) lines.push(`Screen: ${screenW}x${screenH}`, "");
 
   function formatLabel(c: RawEntry): string {
     let label = c.name;
@@ -342,9 +345,9 @@ export function buildTextTree(
     if (displayText) label += ` "${displayText}"`;
     if (c.testID) label += ` [testID=${c.testID}]`;
     if (c.rect && canNormalize) {
-      const tapX = ((c.rect.x + c.rect.w / 2) / screenW).toFixed(2);
-      const tapY = ((c.rect.y + c.rect.h / 2) / screenH).toFixed(2);
-      label += ` (tap: ${tapX},${tapY})`;
+      const tapX = (c.rect.x + c.rect.w / 2) / screenW;
+      const tapY = (c.rect.y + c.rect.h / 2) / screenH;
+      label += ` (tap: ${tapX.toFixed(2)},${tapY.toFixed(2)})`;
     }
     return label;
   }
@@ -459,19 +462,19 @@ export function buildTextTree(
 }
 
 const zodSchema = z.object({
-  port: z.coerce.number().default(8081).describe("Metro server port"),
+  port: metroPortField,
   device_id: z
     .string()
     .describe(
-      "Device id from list-devices — the SAME id you passed to debugger-connect (iOS simulator UDID or Android serial)."
+      "Device id used with debugger-connect<flag:macos-apps>. For macOS, use the Mac app id</flag:macos-apps>."
     ),
   onScreenOnly: z
     .boolean()
     .default(true)
     .describe(
-      "When true (default), only components visible on screen are returned. " +
-        "Set to false to include all mounted components including those scrolled " +
-        "off-screen. Useful when you need to understand the full page structure."
+      "When true, only components visible on screen are returned. " +
+        "Set to false to include all mounted components, including those scrolled " +
+        "off-screen, e.g. to understand the full page structure."
     ),
   maxNodes: z.coerce
     .number()
@@ -485,79 +488,78 @@ const zodSchema = z.object({
     .boolean()
     .default(false)
     .describe(
-      "When true, appends a summary of all filtered components: total fiber count, " +
-        "JS-side skip counts by name, and TS-side filter pass removals. " +
-        "Useful for understanding what was pruned from the tree."
+      "When true, appends a summary of all filtered components: total fiber count " +
+        "and skip counts by component name and by filter."
     ),
 });
 
-export const debuggerComponentTreeTool: ToolDefinition<z.infer<typeof zodSchema>, string> = {
-  id: "debugger-component-tree",
-  interaction: {
-    startedMsg: () => "Reading React component tree",
-    completedMsg: () => "Read React component tree",
-    failedMsg: ({ failureSignal }) =>
-      `Failed to read React component tree: ${failureSignal.error_code}`,
-  },
-  description: `Fetch the current screen of a running React Native app as a compact component text tree.
-Only shows on-screen components with unique positions — off-screen (scrolled) content,
-full-screen transparent wrappers, and implementation-detail components are pruned.
+export function createDebuggerComponentTreeTool(): ToolDefinition<
+  z.infer<typeof zodSchema>,
+  string
+> {
+  return {
+    id: "debugger-component-tree",
+    description: `Fetch the current screen of a running React Native app as a compact tree of React components.
+Each on-screen component is listed with its name, its text (or accessibilityLabel when it has no
+text), [testID=…] and its center as (tap: x,y) fractions of the screen<flag:macos-apps> or Mac app window, including the title bar</flag:macos-apps>.
+Full-screen transparent wrappers and implementation-detail components are pruned. Wrappers the size
+of their parent are pruned too, so a missing name proves nothing: check with debugger-inspect-element.
 
-Each visible component is listed with its name, text content, and normalized
-tap coordinates in [0,1] space (fractions of the screen, not pixels — same space as tap/swipe/gesture).
+Use when you need what describe does not show: a testID for a selector (on Android, describe omits
+the testID of a view that has no label and is not tappable), or the component names and nesting
+behind the screen before editing code. To find what to tap, use describe.
 
-This is the preferred element discovery tool for React Native apps. More information in argent-react-native-app-workflow skill.
+Returns a compact text tree; call again after navigation. Fails if the Metro debugger is disconnected.<flag:macos-apps> On Mac apps with several React Native windows, the tool uses the root with the most components. With the old architecture (Paper), native views around the React root can shift tap points. Use describe for tap targets.</flag:macos-apps>`,
+    zodSchema,
+    searchHint: "react native component tree testID testIDs selector component names hierarchy",
+    readOnly: true,
+    interaction: {
+      startedMsg: () => "Reading React component tree",
+      completedMsg: () => "Read React component tree",
+      failedMsg: ({ failureSignal }) =>
+        `Failed to read React component tree: ${failureSignal.error_code}`,
+    },
+    // RN-only: needs the React DevTools backend from the dev JS bundle. Chromium has
+    // no equivalent — use `describe` there.
+    capability: RN_ONLY_TOOL_CAPABILITY,
+    services: (params) => ({
+      debugger: `JsRuntimeDebugger:${metroPort(params)}:${canonicalDeviceId(params.device_id)}`,
+    }),
+    async execute(services, params) {
+      const api = services.debugger as JsRuntimeDebuggerApi;
+      const requestId = crypto.randomUUID();
+      const script = makeComponentTreeScript({
+        includeSkipped: params.includeSkipped,
+        requestId,
+        addRootOffset: !!canonicalDeviceId(params.device_id)?.startsWith(MACOS_APP_ID_PREFIX),
+      });
+      const response = await api.cdp.evaluateWithBinding(script, requestId, {
+        timeout: 15_000,
+      });
 
-Workflow:
-  1. Call this tool to get the component tree.
-  2. Find the desired element by name, text, testID, or accessibilityLabel.
-  3. Use the (tap: x,y) coordinates directly with the tap tool.
+      const raw = response.result;
+      if (typeof raw !== "string") {
+        return "Error: no result from component tree script";
+      }
 
-Call again after navigation or state changes since positions may shift.
-Set includeSkipped=true to see a summary of all filtered components.
-Use when you need tap coordinates for a React Native UI element. Returns a compact text tree with (tap: x,y) coords. Fails if Metro debugger is not connected.`,
-  alwaysLoad: true,
-  searchHint: "react native component tree discovery tap coordinates",
-  zodSchema,
-  // RN-only: needs the React DevTools backend from the dev JS bundle. Chromium has
-  // no equivalent — use `describe` there.
-  capability: RN_ONLY_TOOL_CAPABILITY,
-  services: (params) => ({
-    debugger: `JsRuntimeDebugger:${params.port}:${canonicalDeviceId(params.device_id)}`,
-  }),
-  async execute(services, params) {
-    const api = services.debugger as JsRuntimeDebuggerApi;
-    const requestId = crypto.randomUUID();
-    const script = makeComponentTreeScript({
-      includeSkipped: params.includeSkipped,
-      requestId,
-    });
-    const response = await api.cdp.evaluateWithBinding(script, requestId, {
-      timeout: 15_000,
-    });
+      const parsed: RawResult = JSON.parse(raw);
+      if (parsed.error) {
+        return `Error: ${parsed.error}`;
+      }
 
-    const raw = response.result;
-    if (typeof raw !== "string") {
-      return "Error: no result from component tree script";
-    }
+      const tree = buildTextTree(parsed, {
+        onScreenOnly: params.onScreenOnly,
+        maxNodes: params.maxNodes,
+        includeSkipped: params.includeSkipped,
+      });
 
-    const parsed: RawResult = JSON.parse(raw);
-    if (parsed.error) {
-      return `Error: ${parsed.error}`;
-    }
+      const deviceLine = [
+        `device: ${api.deviceName}`,
+        `app: ${api.appName}`,
+        ...(api.logicalDeviceId ? [`logicalDeviceId: ${api.logicalDeviceId}`] : []),
+      ].join(" | ");
 
-    const tree = buildTextTree(parsed, {
-      onScreenOnly: params.onScreenOnly,
-      maxNodes: params.maxNodes,
-      includeSkipped: params.includeSkipped,
-    });
-
-    const deviceLine = [
-      `device: ${api.deviceName}`,
-      `app: ${api.appName}`,
-      ...(api.logicalDeviceId ? [`logicalDeviceId: ${api.logicalDeviceId}`] : []),
-    ].join(" | ");
-
-    return `[${deviceLine}]\n${tree}`;
-  },
-};
+      return `[${deviceLine}]\n${tree}`;
+    },
+  };
+}

@@ -1,20 +1,34 @@
 import { execFileSync } from "node:child_process";
+import * as fs from "node:fs";
+import * as path from "node:path";
 import * as p from "@clack/prompts";
 import pc from "picocolors";
 import { track } from "@argent/telemetry";
 import { FAILURE_CODES, type FailureSignal } from "@argent/registry";
 import {
+  ARGENT_SKILL_PREFIX,
   buildArgentSkillsSource,
   getGlobalSkillLockPath,
   getInstalledVersion,
   getProjectSkillLockPath,
+  LEGACY_ARGENT_SKILL_NAMES,
   listArgentSkillsInLock,
   listBundledSkills,
-  withNpmForce,
+  npxChildEnv,
+  removePath,
   SKILLS_DIR,
 } from "./utils.js";
+import { ALL_ADAPTERS, getManagedContentTargets } from "./mcp-configs.js";
+import {
+  NO_SKILLS_RUNNER_MESSAGE,
+  noSkillsRunnerHelp,
+  resolveSkillsRunner,
+  skillsCommand,
+} from "./skills-runner.js";
 
 type SkillScope = "project" | "global";
+
+const ARGENT_SKILL_NAME = /^argent-[a-z0-9-]+$/;
 
 interface SkillScopeResult {
   scope: SkillScope;
@@ -42,6 +56,8 @@ interface ScopeSpec {
   removeArgs: string[];
 }
 
+type SkillRefreshScopes = "all" | "global";
+
 function getScopeSpecs(projectRoot: string): ScopeSpec[] {
   return [
     {
@@ -66,7 +82,10 @@ function getScopeSpecs(projectRoot: string): ScopeSpec[] {
 //
 // Sync prefers the GitHub-pinned source so the lockfile entry stays portable
 // across machines, and retries with the bundled SKILLS_DIR when that fails.
-export function refreshArgentSkills(projectRoot: string): SkillScopeResult[] {
+export function refreshArgentSkills(
+  projectRoot: string,
+  scopes: SkillRefreshScopes = "all"
+): SkillScopeResult[] {
   const bundled = new Set(listBundledSkills());
   // An empty bundled set means this package's skills dir is unreadable (broken
   // or mid-update install), not that argent ships no skills — acting on it
@@ -74,19 +93,36 @@ export function refreshArgentSkills(projectRoot: string): SkillScopeResult[] {
   if (bundled.size === 0) return [];
   const results: SkillScopeResult[] = [];
   const primarySource = buildArgentSkillsSource(getInstalledVersion());
+  // Resolved once for the whole refresh — every scope's calls share it.
+  const runner = resolveSkillsRunner();
   // Project-scope `skills` commands act on their cwd, and this can run from a
   // detached updater that inherited the tool-server's editor-chosen cwd (often
   // `/` or `$HOME`) — pin every run to the project.
-  const execOpts = { stdio: ["ignore", "pipe", "pipe"] as const, cwd: projectRoot } as {
+  const execOpts = {
+    stdio: ["ignore", "pipe", "pipe"] as const,
+    cwd: projectRoot,
+    env: npxChildEnv(),
+  } as {
     stdio: ["ignore", "pipe", "pipe"];
     cwd: string;
+    env: NodeJS.ProcessEnv;
+  };
+  const runSkills = (skillsArgs: string[]): void => {
+    if (!runner) throw new Error(NO_SKILLS_RUNNER_MESSAGE);
+    const command = skillsCommand(runner, skillsArgs);
+    execFileSync(command.file, command.args, { ...execOpts, shell: command.shell });
   };
 
-  for (const spec of getScopeSpecs(projectRoot)) {
+  const specs = getScopeSpecs(projectRoot).filter(
+    (spec) => scopes === "all" || spec.scope === "global"
+  );
+  for (const spec of specs) {
     const tracked = listArgentSkillsInLock(spec.lockPath);
     if (tracked.length === 0) continue;
 
-    const orphaned = tracked.filter((name) => !bundled.has(name));
+    // Lockfile names are project data and end up in the skills CLI's argv, so
+    // only names shaped like argent's own skills are pruned.
+    const orphaned = tracked.filter((name) => !bundled.has(name) && ARGENT_SKILL_NAME.test(name));
     const result: SkillScopeResult = {
       scope: spec.scope,
       synced: 0,
@@ -96,7 +132,7 @@ export function refreshArgentSkills(projectRoot: string): SkillScopeResult[] {
     };
 
     try {
-      execFileSync("npx", withNpmForce(spec.buildAddArgs(primarySource)), execOpts);
+      runSkills(spec.buildAddArgs(primarySource));
       result.synced = bundled.size;
     } catch (primaryErr) {
       if (primarySource === SKILLS_DIR) {
@@ -104,7 +140,7 @@ export function refreshArgentSkills(projectRoot: string): SkillScopeResult[] {
           primaryErr instanceof Error ? primaryErr.message.split("\n")[0] : String(primaryErr);
       } else {
         try {
-          execFileSync("npx", withNpmForce(spec.buildAddArgs(SKILLS_DIR)), execOpts);
+          runSkills(spec.buildAddArgs(SKILLS_DIR));
           result.synced = bundled.size;
         } catch (fallbackErr) {
           result.syncError =
@@ -115,11 +151,15 @@ export function refreshArgentSkills(projectRoot: string): SkillScopeResult[] {
 
     if (orphaned.length > 0) {
       try {
-        execFileSync("npx", withNpmForce([...spec.removeArgs, ...orphaned]), execOpts);
+        runSkills([...spec.removeArgs, ...orphaned]);
         result.pruned = orphaned;
       } catch (err) {
         result.pruneError = err instanceof Error ? err.message.split("\n")[0] : String(err);
       }
+    }
+
+    for (const name of pruneLegacySkillDirs(projectRoot, spec.scope, bundled)) {
+      if (!result.pruned.includes(name)) result.pruned.push(name);
     }
 
     results.push(result);
@@ -128,13 +168,118 @@ export function refreshArgentSkills(projectRoot: string): SkillScopeResult[] {
   return results;
 }
 
+// The skills in `names` found on disk in a scope, each with a stamp of its
+// SKILL.md in every skill dir (inode and mtime). The skills CLI rewrites a skill
+// it installs, so two snapshots tell whether a run installed anything. stat
+// follows links, so an editor's link to the shared copy counts like the copy.
+// With no names (an unreadable bundled set), any argent-prefixed skill counts.
+export function snapshotArgentSkills(
+  projectRoot: string,
+  scope: SkillScope,
+  names: readonly string[]
+): Map<string, string> {
+  const { skillTargets } = getManagedContentTargets(
+    ALL_ADAPTERS,
+    projectRoot,
+    scope === "global" ? "global" : "local"
+  );
+  const found = new Map<string, string>();
+  for (const { targetPath } of skillTargets) {
+    let candidates: readonly string[] = names;
+    if (names.length === 0) {
+      try {
+        candidates = fs.readdirSync(targetPath).filter((n) => n.startsWith(ARGENT_SKILL_PREFIX));
+      } catch {
+        continue;
+      }
+    }
+    for (const name of candidates) {
+      const stat = fs.statSync(path.join(targetPath, name, "SKILL.md"), { throwIfNoEntry: false });
+      if (!stat?.isFile()) continue;
+      found.set(name, `${found.get(name) ?? ""}${stat.ino}:${stat.mtimeMs};`);
+    }
+  }
+  return found;
+}
+
+// A renamed skill's old dir can outlive its lock entry (or never have had one),
+// so `skills remove` never sees it. Removes it, editor links to it, and its
+// lock entry from the scope. Returns the names removed.
+export function pruneLegacySkillDirs(
+  projectRoot: string,
+  scope: SkillScope,
+  bundled: ReadonlySet<string> = new Set(listBundledSkills())
+): string[] {
+  // An empty bundled set means an unreadable skills dir, not a skill-free
+  // release; see refreshArgentSkills.
+  if (bundled.size === 0) return [];
+  const legacy = LEGACY_ARGENT_SKILL_NAMES.filter((name) => !bundled.has(name));
+  const { skillTargets } = getManagedContentTargets(
+    ALL_ADAPTERS,
+    projectRoot,
+    scope === "global" ? "global" : "local"
+  );
+  const removed = new Set<string>();
+  for (const { targetPath } of skillTargets) {
+    for (const name of legacy) {
+      const dir = path.join(targetPath, name);
+      try {
+        // An editor link into an emptied .agents/skills dangles, and goes too.
+        if (removePath(dir)) removed.add(name);
+      } catch {
+        // non-fatal
+      }
+    }
+  }
+  const lockPath =
+    scope === "global" ? getGlobalSkillLockPath() : getProjectSkillLockPath(projectRoot);
+  for (const name of removeLockEntries(lockPath, legacy)) removed.add(name);
+  return [...removed].sort();
+}
+
+// Legacy names the scope's lock still tracks. `skills remove` them before
+// pruneLegacySkillDirs drops their lock entries: only the skills CLI knows
+// every agent dir it linked them into (Kiro, Hermes, Windsurf, ...).
+export function listTrackedLegacySkills(
+  projectRoot: string,
+  scope: SkillScope,
+  bundled: ReadonlySet<string> = new Set(listBundledSkills())
+): string[] {
+  if (bundled.size === 0) return [];
+  const lockPath =
+    scope === "global" ? getGlobalSkillLockPath() : getProjectSkillLockPath(projectRoot);
+  return listArgentSkillsInLock(lockPath).filter(
+    (name) => LEGACY_ARGENT_SKILL_NAMES.includes(name) && !bundled.has(name)
+  );
+}
+
+// Drops `names` from a skills lockfile so a committed lock cannot restore them.
+function removeLockEntries(lockPath: string, names: readonly string[]): string[] {
+  try {
+    const lock = JSON.parse(fs.readFileSync(lockPath, "utf8")) as {
+      skills?: Record<string, unknown>;
+    };
+    const skills = lock.skills;
+    if (!skills) return [];
+    const removed = names.filter((name) => name in skills);
+    if (removed.length === 0) return [];
+    for (const name of removed) delete skills[name];
+    fs.writeFileSync(lockPath, JSON.stringify(lock, null, 2) + "\n");
+    return removed;
+  } catch {
+    return [];
+  }
+}
+
 // Returns null when nothing happened, so the caller can skip printing an empty
 // block.
 export function formatSkillRefreshSummary(results: readonly SkillScopeResult[]): string | null {
   const lines: string[] = [];
   for (const r of results) {
     const parts: string[] = [];
-    if (r.syncError) {
+    if (r.syncError === NO_SKILLS_RUNNER_MESSAGE) {
+      parts.push(`${pc.red("not synced")} ${pc.dim("(no package runner, see above)")}`);
+    } else if (r.syncError) {
       parts.push(`${pc.red("sync failed")} ${pc.dim(`(${r.syncError})`)}`);
     } else if (r.synced > 0) {
       parts.push(`synced ${r.synced}`);
@@ -168,8 +313,15 @@ function summarizeSkillRefreshForTelemetry(
 // differ only in this stage name.
 type SkillRefreshStage = "installer_skills_refresh" | "installer_update_skills_refresh";
 
-export function reportSkillRefresh(projectRoot: string, stage: SkillRefreshStage): void {
-  const results = refreshArgentSkills(projectRoot);
+export function reportSkillRefresh(
+  projectRoot: string,
+  stage: SkillRefreshStage,
+  scopes: SkillRefreshScopes = "all"
+): void {
+  const results = refreshArgentSkills(projectRoot, scopes);
+  if (results.some((r) => r.syncError === NO_SKILLS_RUNNER_MESSAGE)) {
+    p.log.warn(noSkillsRunnerHelp("argent update"));
+  }
   const summary = formatSkillRefreshSummary(results);
   if (summary) {
     p.note(summary, "Skills Updated");

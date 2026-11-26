@@ -7,7 +7,8 @@ import { isFlagEnabled } from "@argent/configuration-core";
 import type { Registry } from "@argent/registry";
 import { track } from "@argent/telemetry";
 import { simulatorServerRef, type SimulatorServerApi } from "./blueprints/simulator-server";
-import { resolveDevice } from "./utils/device-info";
+import { isIosSimulator, resolveDevice } from "./utils/device-info";
+import { resolveLivePanel, streamUrlForScreen, unresolvedPanelNote } from "./utils/foldable";
 import { classifyDeviceForTelemetry } from "./utils/telemetry-platform";
 import { shutdownDevice } from "./utils/device-shutdown";
 import { listDevicesTool } from "./tools/devices/list-devices";
@@ -20,6 +21,7 @@ import {
 } from "./utils/variant-proposals";
 import type { DescribeTreeData } from "./tools/describe/contract";
 import { describeIos } from "./tools/describe/platforms/ios";
+import { readUiOrientation } from "./utils/ios-ui-orientation";
 import { describeAndroid } from "./tools/describe/platforms/android";
 
 function findUiFile(name: string): string | null {
@@ -150,7 +152,7 @@ export function createPreviewRouter(registry: Registry): Router {
           | { platform: "ios"; udid: string; name: string; state: string; runtime: string }
           | {
               platform: "android";
-              serial: string;
+              serial?: string;
               state: string;
               avdName?: string;
               model?: string;
@@ -184,7 +186,8 @@ export function createPreviewRouter(registry: Registry): Router {
             },
           ];
         }
-        if (d.platform === "android") {
+        // An AVD that is not running has no serial to stream or boot by.
+        if (d.platform === "android" && d.serial !== undefined) {
           return [
             {
               udid: d.serial,
@@ -234,11 +237,33 @@ export function createPreviewRouter(registry: Registry): Router {
       }
       const { urn, options } = simulatorServerRef(device);
       const api = await registry.resolveService<SimulatorServerApi>(urn, options);
+      // A foldable is handed the stream of the panel it renders to, resolved
+      // now: the UI re-asks this route while connected to one and moves its
+      // stream (and the screen its touches name) when the answer changes. When
+      // neither source answers, the main screen, as every command then does,
+      // and the answer says so.
+      let streamUrl = api.streamUrl;
+      let panel:
+        { foldable: true; activeScreen: number; panelSource: string; warning?: string } | undefined;
+      if (api.display?.foldable) {
+        const live = await resolveLivePanel(udid);
+        streamUrl = streamUrlForScreen(api.streamUrl, live.screen);
+        panel = { foldable: true, activeScreen: live.screen, panelSource: live.source };
+        if (live.source === "unknown") {
+          panel.warning = unresolvedPanelNote(
+            udid,
+            live.reason,
+            "the preview shows",
+            api.display.panels
+          );
+        }
+      }
       res.json({
         udid,
         apiUrl: api.apiUrl,
-        streamUrl: api.streamUrl,
+        streamUrl,
         wsUrl: wsUrlFromHttp(api.apiUrl),
+        ...(panel ?? {}),
       });
     } catch (err) {
       res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
@@ -610,10 +635,17 @@ export function createPreviewRouter(registry: Registry): Router {
       }
       const data: DescribeTreeData =
         device.platform === "ios"
-          ? await describeIos(registry, device, {})
+          ? // Drawn over the native video stream, so in its portrait-native space.
+            await describeIos(registry, device, {}, { frameSpace: "native" })
           : await describeAndroid(registry, udid);
+      // How the UI lies on that space, for the page to turn a frame by when it
+      // crops a screenshot, which is upright. Answered from the read just made.
+      const uiOrientation =
+        device.platform === "ios" && isIosSimulator(device)
+          ? (await readUiOrientation(device.id)).orientation
+          : undefined;
       res.set("Cache-Control", "no-store");
-      res.json(data);
+      res.json(uiOrientation ? { ...data, uiOrientation } : data);
     } catch (err) {
       res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
     }

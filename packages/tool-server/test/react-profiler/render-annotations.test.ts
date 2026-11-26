@@ -1,4 +1,4 @@
-import { describe, it, expect } from "vitest";
+import { describe, it, expect, afterEach } from "vitest";
 import { promises as fs } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
@@ -40,12 +40,17 @@ const ANNOTATIONS = [
 
 const SESSION_CONTEXT: SessionContext = {
   reactCompilerEnabled: false,
-  strictModeEnabled: false,
   buildMode: "dev",
   rnArchitecture: "bridgeless",
   projectRoot: "/tmp/fake-project",
   platform: "ios",
 };
+
+const debugDirs: string[] = [];
+
+afterEach(async () => {
+  for (const dir of debugDirs.splice(0)) await fs.rm(dir, { recursive: true, force: true });
+});
 
 async function makeDebugDir(): Promise<string> {
   const dir = join(
@@ -53,6 +58,7 @@ async function makeDebugDir(): Promise<string> {
     `argent-render-annotations-${Date.now()}-${Math.random().toString(36).slice(2)}`
   );
   await fs.mkdir(dir, { recursive: true });
+  debugDirs.push(dir);
   return dir;
 }
 
@@ -85,8 +91,6 @@ describe("renderProfilingReport — annotation reference frame", () => {
 
     expect(between).toContain("(t=17.6s)");
     expect(after50).toContain("(t=192.3s)");
-
-    await fs.rm(debugDir, { recursive: true, force: true });
   });
 
   it("renders without annotations when none are provided", async () => {
@@ -104,7 +108,30 @@ describe("renderProfilingReport — annotation reference frame", () => {
     expect(report).toContain("### Commit #50");
     expect(report).toContain("### Commit #0");
     expect(report).not.toMatch(/> After:/);
+  });
+});
 
-    await fs.rm(debugDir, { recursive: true, force: true });
+describe("renderProfilingReport — reading grouped rows", () => {
+  it("explains why a grouped row's self can exceed its w/children", async () => {
+    // Three sibling Views, 1ms each: 3ms self in total, 1ms for the largest instance.
+    const grouped: HotCommitSummary = {
+      ...SUMMARIES[0]!,
+      components: [{ name: "View", selfDurationMs: 3, actualDurationMs: 1, count: 3 }],
+      totalComponentCount: 1,
+    };
+    const { report } = await renderProfilingReport({
+      hotCommitSummaries: [grouped],
+      componentFindings: [],
+      sessionContext: SESSION_CONTEXT,
+      recordingMs: 200_000,
+      anyRuntimeCompilerDetected: false,
+      reactCommits: 1,
+      debugDir: await makeDebugDir(),
+    });
+
+    expect(report).toContain("- `View` ×3 — 3ms self, 1ms w/children");
+    expect(report).toContain(
+      "On a grouped `×N` row it is\n> the largest single instance, while `self` is the total of all N."
+    );
   });
 });

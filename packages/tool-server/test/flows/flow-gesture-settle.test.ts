@@ -45,9 +45,12 @@ vi.mock("../../src/tools/flows/flow-tree", async (importOriginal) => ({
 import { settleTree, type ActionEnv } from "../../src/tools/flows/flow-actions";
 import { createRunFlowTool, type FlowRunResult } from "../../src/tools/flows/flow-run";
 import { serializeFlow } from "../../src/tools/flows/flow-utils";
+import { useAutoAdvancingClock } from "../helpers/auto-clock";
+
+useAutoAdvancingClock();
 
 const DEVICE = "00000000-0000-0000-0000-0000000000ab"; // iOS UDID shape
-/** The same simulator addressed through sim-remote — platform `ios-remote`, which has no flow tree. */
+/** The same simulator addressed through sim-remote — platform `ios-remote`, which reads the iOS flow tree. */
 const REMOTE_DEVICE = `remote:${DEVICE}`;
 let tmpDir: string;
 
@@ -241,9 +244,9 @@ describe("a tree-source outage never fails a selector-less gesture", () => {
   }, 15_000);
 
   it("charges one outage window for a run of gestures, not one per gesture", async () => {
-    // The shape this matters for: a source that serves no tree at all
-    // (`ios-remote`, an app the instrumentation cannot load) against a flow
-    // made of coordinate gestures, which is the only kind such a run can have.
+    // The shape this matters for: a source that serves no tree at all (an app
+    // the instrumentation cannot load) against a flow made of coordinate
+    // gestures, which is the only kind such a run can have.
     // Consecutive ones, at that: a foreground-changing `tool:` step between two
     // gestures re-arms the window for the second, which the arms below pin.
     currentTree = outage;
@@ -489,8 +492,7 @@ describe("a tree-source outage never fails a selector-less gesture", () => {
       // And the budget was spent whole: no two reads ever match, so the tap
       // waited the full 3000ms window at the 250ms poll - at most 13 reads (12
       // intervals plus the first), and never the 2 a converging settle returns
-      // on. Only the ceiling is fixed; slower polls on a loaded machine cost
-      // reads, not window, which is what the elapsed time pins instead.
+      // on.
       expect(readsBeforeFirstGesture()).toBeGreaterThan(2);
       expect(readsBeforeFirstGesture()).toBeLessThanOrEqual(13);
       expect(elapsed).toBeGreaterThanOrEqual(3_000);
@@ -653,20 +655,14 @@ describe("a tree-source outage never fails a selector-less gesture", () => {
   }, 20_000);
 });
 
-// The other half of that best effort: a source that is ABSENT is not a source
-// that is down. `fetchFlowTree` serves no tree on `ios-remote`, so every
-// selector directive already fails there and a coordinate flow is the only kind
-// such a run can have - charging each of its gestures a window, and then telling
-// every one of them to restore a source that never existed, warns a fully green
-// run about a degradation that never happened.
-describe("a platform with no tree source settles nothing and warns nothing", () => {
-  /** What a read gets on such a platform - `fetchTree`'s own refusal, verbatim. */
-  const unsupported = (): DescribeNode => {
-    throw new Error('ui-tree matching is not supported on platform "ios-remote"');
-  };
-
-  it("dispatches a coordinate tap without reading the tree at all", async () => {
-    currentTree = unsupported;
+// A remote simulator is an iOS simulator reached over the sim-remote tunnel,
+// and `fetchFlowTree` now reads the same full hierarchy there that a local one
+// reads. So none of this file's behaviour is special-cased for it: it settles
+// like a local sim, and an outage on it is reported like an outage on one. The
+// old regression - a coordinate flow dispatching blind, with no settle and no
+// warning, because the platform had no source at all - is what these guard.
+describe("a remote simulator settles like a local one", () => {
+  it("settles a coordinate tap before dispatching it", async () => {
     await writeFlow("tap-remote", {
       executionPrerequisite: "",
       steps: [{ kind: "tap", x: 0.4, y: 0.6 }],
@@ -675,18 +671,36 @@ describe("a platform with no tree source settles nothing and warns nothing", () 
     const result = await run("tap-remote", undefined, REMOTE_DEVICE);
 
     expect(result.steps.map((s) => `${s.kind}:${s.status}`)).toEqual(["tap:pass"]);
-    // Not one read, let alone the whole window an outage is proven over.
-    expect(readsBeforeFirstGesture()).toBe(0);
+    // Two identical reads are what "settled" means - the same bar the local
+    // coordinate tap at the top of this file clears.
+    expect(readsBeforeFirstGesture()).toBeGreaterThanOrEqual(2);
     expect(gestures()[0]).toMatchObject({ tool: "gesture-tap", args: { x: 0.4, y: 0.6 } });
-    // And the run prints clean: no `⚠` on the step, no warning count on the summary.
+    // A settle that ran carries no warning.
     expect(result.steps[0].warning).toBeUndefined();
   });
 
-  it("still fails a selector step there, exactly as before", async () => {
-    // Only the best-effort caller may skip. A selector needs a frame out of the
-    // tree, so a platform that serves none must keep failing the step outright
-    // rather than inheriting the pass this file's other case pins.
-    currentTree = unsupported;
+  it("warns an unsettled gesture there in the same words iOS gets", async () => {
+    // The source can be DOWN on a remote sim now that it exists, so the
+    // best-effort path applies unchanged: the gesture still goes out, and the
+    // step still says it went out blind.
+    currentTree = outage;
+    await writeFlow("tap-remote-blind", {
+      executionPrerequisite: "",
+      steps: [{ kind: "tap", x: 0.4, y: 0.6 }],
+    });
+
+    const result = await run("tap-remote-blind", undefined, REMOTE_DEVICE);
+
+    expect(result.steps.map((s) => `${s.kind}:${s.status}`)).toEqual(["tap:pass"]);
+    expect(result.steps[0].warning).toContain("without settling the screen");
+    expect(result.steps[0].warning).toContain("native devtools is unavailable");
+  }, 20_000);
+
+  it("resolves a selector step there to a frame out of the tree it reads", async () => {
+    // This file stubs the fetch, so this pins the runner's side only. Which
+    // source a remote read dispatches to is pinned in flow-remote-tree.test.ts.
+    currentTree = () =>
+      screen([{ role: "AXButton", label: "Continue", frame: BUTTON, children: [] }]);
     await writeFlow("tap-remote-selector", {
       executionPrerequisite: "",
       steps: [{ kind: "tap", selector: { text: "Continue", loose: true } }],
@@ -694,9 +708,11 @@ describe("a platform with no tree source settles nothing and warns nothing", () 
 
     const result = await run("tap-remote-selector", undefined, REMOTE_DEVICE);
 
-    expect(result.steps.map((s) => `${s.kind}:${s.status}`)).toEqual(["tap:error"]);
-    expect(result.steps[0].reason).toContain("not supported on platform");
-    expect(gestures()).toEqual([]);
+    expect(result.steps.map((s) => `${s.kind}:${s.status}`)).toEqual(["tap:pass"]);
+    // The centre of BUTTON - a frame read out of the remote tree.
+    expect(gestures()[0]?.tool).toBe("gesture-tap");
+    expect(gestures()[0]?.args.x).toBeCloseTo(0.5, 5);
+    expect(gestures()[0]?.args.y).toBeCloseTo(0.45, 5);
   }, 20_000);
 });
 
@@ -855,9 +871,8 @@ describe("a proven outage is spent only on the device that proved it", () => {
 // precisely so an iOS cold-start stall is ridden out instead of failed. The
 // abort in the block below is the one thing that does cut such a read short.
 describe("the settle window bounds its retries, not the read in flight", () => {
-  // One whole window (3000ms) plus the least margin that still tells "waited it
-  // out" from "cut it off at the deadline". The window cannot be made cheaper,
-  // so the margin is the only part of this test's cost there is to keep down.
+  // One whole window (3000ms) plus a margin that tells "waited it out" from
+  // "cut it off at the deadline".
   const SLOW_READ_MS = 3_500;
 
   it("waits out every read slower than the whole window", async () => {

@@ -12,15 +12,35 @@ import {
   type ServiceEvents,
 } from "@argent/registry";
 import { simulatorServerBinaryPath, simulatorServerRunDir } from "@argent/native-devtools-ios";
-import { ensureAutomationEnabled } from "./ax-service";
+import { getAndroidSdkRoot } from "@argent/configuration-core";
+import { clearAutomationEnabledOrWarn } from "../utils/ax-prefs";
 import { ensureDep } from "../utils/check-deps";
-import { isTvOsSimulator } from "../utils/ios-devices";
+import { isFoldableSimulator, isTvOsSimulator } from "../utils/ios-devices";
 import { deviceSetForUdid } from "../utils/ios-device-sets";
 import { UnsupportedOperationError } from "../utils/capability";
 import { openMoqClient } from "../utils/moq-client";
-import { createMoqTransport } from "../utils/simulator-client";
+import { openMjpegStream } from "../tools/screen-recording/mjpeg-stream";
+import {
+  createMoqTransport,
+  fetchDisplayState,
+  KEY_ACK_TIMEOUT_MS,
+  sendCommand,
+  type SimulatorDisplayState,
+} from "../utils/simulator-client";
+import {
+  assertExternalCapability,
+  externalClaimForAnyId,
+  type ExternalDevice,
+} from "../utils/external-devices";
 import { simctlPbcopy } from "../utils/sim-remote";
-import { encodeKey } from "../utils/datachannel-proto";
+import { registerCaptureOnDemandSender } from "../utils/profiling-devices";
+import { firstSimulatorPoll } from "../utils/simulator-watcher";
+import {
+  detectAgentSocket,
+  listAgentReverseSockets,
+  reapAndroidScreenSharingAgent,
+  trackAgentReap,
+} from "../utils/android-agent-reap";
 
 export const SIMULATOR_SERVER_NAMESPACE = "SimulatorServer";
 
@@ -51,17 +71,129 @@ const getPaths = () => {
 
 const READY_TIMEOUT_MS = 30_000;
 
+/**
+ * How long a dispose gives the binary to exit after SIGTERM before Argent reaps
+ * what it left on the device. About twice the ~1.3 s a healthy device-side
+ * teardown takes, so a binary that cleans up after itself always wins and the
+ * reap log only reports what was really left behind.
+ */
+const EXIT_GRACE_MS = 2_500;
+
+/** Resolve once `proc` has exited or `timeoutMs` elapsed, whichever is first. */
+function waitForExit(proc: ChildProcess, timeoutMs: number): Promise<void> {
+  if (proc.exitCode != null || proc.signalCode != null) return Promise.resolve();
+  return new Promise<void>((resolve) => {
+    const done = () => {
+      clearTimeout(timer);
+      proc.off("exit", done);
+      resolve();
+    };
+    const timer = setTimeout(done, timeoutMs);
+    proc.once("exit", done);
+  });
+}
+
+// `exit` can fire before the child's stderr is drained, and the last stderr
+// line is usually the reason it exited. Wait this long for the stream to end.
+const STDERR_DRAIN_MS = 250;
+const STDERR_TAIL_LINES = 10;
+const STDERR_MAX_LINE_CHARS = 500;
+
+// env_logger's routine lines ("[<ts> INFO  simulator_server::…] …") say nothing
+// about why the binary stopped; its errors are printed without that prefix.
+const ROUTINE_LOG_LINE = /^\[\S+\s+(?:INFO|DEBUG|TRACE)\s/;
+
+function exitedBeforeReadyMessage(
+  code: number | null,
+  signal: NodeJS.Signals | null,
+  stderrTail: readonly string[]
+): string {
+  const how =
+    typeof code === "number"
+      ? `exited with code ${code}`
+      : signal
+        ? `was killed by ${signal}`
+        : "exited";
+  const reason = stderrTail.join("\n");
+  return `simulator-server ${how} before becoming ready${reason ? `:\n${reason}` : ""}`;
+}
+
 export interface SimulatorServerApi {
   apiUrl: string;
   streamUrl: string;
-  /** Send a key Down or Up event by USB HID keycode. */
-  pressKey(direction: "Down" | "Up", keyCode: number): void;
+  /**
+   * Send a key Down or Up event by USB HID keycode.
+   *
+   * Awaitable because the transports differ in what they can promise. On a
+   * spawned or a provider's server the key rides the WebSocket, which
+   * acknowledges it, so the returned promise rejects on a lost or refused
+   * press. MoQ has no ack, but a write the session refuses still rejects. The
+   * callers await uniformly and each transport reports what it actually knows.
+   *
+   * The ack says the server took the key, not that the app applied it: the
+   * keyboard tool reads the field back for that.
+   */
+  pressKey(direction: "Down" | "Up", keyCode: number): Promise<void>;
   /**
    * Set for ios-remote so the shared `sendCommand` / `httpScreenshot` helpers in
    * `simulator-client.ts` route through MoQ instead of WebSocket + HTTP.
    * Undefined for local sims.
    */
   transport?: import("../utils/simulator-client").SimulatorServerTransport;
+  /**
+   * `true` when this server belongs to an external provider rather than a
+   * process Argent spawned. `simulator-client.ts` uses it to enforce the parity
+   * rule (`ALLOWED_SIM_SERVER_ENDPOINTS`): Argent may only use surfaces its own
+   * build serves, so attaching never becomes consuming a provider's extras.
+   */
+  external?: boolean;
+  /**
+   * The device this server drives, as the tools name it. Read by
+   * `simulator-client.ts` to look up per-device state that lives outside the
+   * server — the active panel of a foldable.
+   */
+  deviceId?: string;
+  /**
+   * Set for a foldable simulator whose server reported its panels: the server
+   * captures every panel and follows none, so every touch, wheel, screenshot
+   * and stream then names the panel the guest renders to, resolved at that
+   * moment (`utils/foldable.ts`). Undefined for every other device, and for a
+   * foldable driven by a server build that predates panels, which stays on
+   * screen 1 as before.
+   */
+  display?: SimulatorDisplayState;
+}
+
+/** Bound on the `GET /api/display` probe a foldable's server gets at attach time. */
+const DISPLAY_PROBE_TIMEOUT_MS = 3_000;
+
+/**
+ * Give a foldable simulator's server its panel list, so the commands that
+ * follow name a panel. Which panel is live is not read here: every command
+ * resolves it when it runs.
+ *
+ * Only a device whose profile is foldable is probed at all, so the common case
+ * pays nothing. A foldable whose server answers with no panels — a build that
+ * predates them, or a provider's — is left without `display`: nothing names a
+ * screen and the device is driven on its cover panel, exactly as before.
+ */
+async function attachFoldableDisplay(api: SimulatorServerApi, device: DeviceInfo): Promise<void> {
+  if (device.platform !== "ios" || api.transport) return;
+  if (!(await isFoldableSimulator(device.id))) return;
+  const tag = `[sim ${device.id.slice(0, 8)}]`;
+  const display = await fetchDisplayState(api, AbortSignal.timeout(DISPLAY_PROBE_TIMEOUT_MS));
+  if (!display?.foldable) {
+    process.stderr.write(
+      `${tag} this simulator is foldable, but its simulator-server reports no panels; ` +
+        `it will be driven on screen 1 (the cover panel) only.\n`
+    );
+    return;
+  }
+  api.display = display;
+  const panels = display.panels.map((p) => `${p.screenId} (${p.width}x${p.height})`).join(", ");
+  process.stderr.write(
+    `${tag} foldable simulator with screens ${panels}; every command names the live panel\n`
+  );
 }
 
 /**
@@ -79,13 +211,14 @@ async function buildRemoteInstance(
     pasteText: async (text: string) => {
       await simctlPbcopy(device.id, text);
       // USB HID usage ids: 0xE3 = Left GUI (Cmd), 0x19 = V. Cmd+V on the
-      // remote sim is what actually fires the paste.
+      // remote sim is what actually fires the paste. Pressed through
+      // `api.pressKey`, so a refused key fails like any other refused input.
       const CMD = 0xe3;
       const V = 0x19;
-      await moq.sendControl(encodeKey({ action: "Down", code: CMD }));
-      await moq.sendControl(encodeKey({ action: "Down", code: V }));
-      await moq.sendControl(encodeKey({ action: "Up", code: V }));
-      await moq.sendControl(encodeKey({ action: "Up", code: CMD }));
+      await api.pressKey("Down", CMD);
+      await api.pressKey("Down", V);
+      await api.pressKey("Up", V);
+      await api.pressKey("Up", CMD);
     },
   });
 
@@ -97,8 +230,16 @@ async function buildRemoteInstance(
   const api: SimulatorServerApi = {
     apiUrl: stubUrl,
     streamUrl: stubUrl,
-    pressKey: (direction, keyCode) => {
-      void moq.sendControl(encodeKey({ action: direction, code: keyCode }));
+    deviceId: device.id,
+    // Through `sendCommand`, as the attached instance below does, so a key the
+    // session refuses reports the same failure as a refused touch instead of a
+    // bare SDK error the caller cannot classify.
+    pressKey: async (direction, keyCode) => {
+      await sendCommand(
+        api,
+        { cmd: "key", code: keyCode, direction },
+        { ackTimeoutMs: KEY_ACK_TIMEOUT_MS }
+      );
     },
     transport,
   };
@@ -109,6 +250,61 @@ async function buildRemoteInstance(
       await moq.close();
     },
     events,
+  };
+}
+
+/**
+ * Attach to a simulator-server an external provider is already running,
+ * instead of spawning one.
+ *
+ * `simulator-client.ts` is entirely URL-driven and the control API is
+ * multi-client (the MJPEG stream refcounts consumers), so this is only about
+ * not spawning. The rest of the stack is reused verbatim.
+ *
+ *  - `dispose()` is a no-op. Argent must never kill a process it did not
+ *    start.
+ *  - `pressKey` goes through `sendCommand`, as on a spawned server: an
+ *    attached server has no `stdin` Argent could write to.
+ */
+async function buildAttachedInstance(
+  device: DeviceInfo,
+  /**
+   * Read by the caller in this same factory run, which is the whole
+   * reconnection story. A restarted simulator-server rebinds an ephemeral port,
+   * the next call gets `ECONNREFUSED`, `recoverable()` disposes, the registry
+   * re-runs this factory and that fresh read picks up the new port.
+   */
+  externalDevice: ExternalDevice
+): Promise<ServiceInstance<SimulatorServerApi>> {
+  await assertExternalCapability(SIMULATOR_SERVER_NAMESPACE, device, "simulator-server");
+
+  if (!externalDevice.simulatorServer) {
+    throw new UnsupportedOperationError(
+      SIMULATOR_SERVER_NAMESPACE,
+      device,
+      `${externalDevice.provider.name} did not publish a simulator-server endpoint for this device`
+    );
+  }
+
+  const api: SimulatorServerApi = {
+    apiUrl: externalDevice.simulatorServer.apiUrl,
+    deviceId: device.id,
+    external: true,
+    pressKey: async (direction, code) => {
+      await sendCommand(api, { cmd: "key", code, direction }, { ackTimeoutMs: KEY_ACK_TIMEOUT_MS });
+    },
+    streamUrl: externalDevice.simulatorServer.streamUrl,
+    /** `transport: undefined`, so the WS + HTTP path is reused unchanged. */
+  };
+
+  // A provider's build without the display route answers 404 and the device
+  // stays single-panel; the route itself is on the parity allow-list.
+  await attachFoldableDisplay(api, device);
+
+  return {
+    api,
+    dispose: async () => {},
+    events: new TypedEventEmitter<ServiceEvents>(),
   };
 }
 
@@ -124,8 +320,97 @@ const SAFE_SIMULATOR_DEVICE_ID = /^[A-Za-z0-9][A-Za-z0-9._:-]*$/;
  * agent over adb) is picked by `kind`, not by platform alone.
  */
 function subcommandForDevice(device: DeviceInfo): "ios" | "android" | "android_device" {
-  if (device.platform === "ios") return "ios";
+  if (device.platform === "ios") {
+    // Defense-in-depth: physical iPhones are driven by the XCUITest
+    // runner blueprint, never by simulator-server. A services() mistake that
+    // routes one here must fail loudly instead of spawning a simulator-server
+    // process against a hardware UDID.
+    if (device.kind === "device") {
+      throw new Error(
+        `simulator-server cannot drive a physical iOS device (${device.id}); ` +
+          `physical devices use the ios-device-runner service.`
+      );
+    }
+    return "ios";
+  }
   return device.kind === "device" ? "android_device" : "android";
+}
+
+/**
+ * The emulator controller finds an AVD's gRPC bridge through the emulator's
+ * `avd/running/pid_*.ini` discovery file. An emulator started under another
+ * user or HOME, or with `-port`, has no such file where argent looks. The phone
+ * controller (screen-sharing agent over adb) needs only adb, so such an
+ * emulator is retried through it. A stale discovery file left by a dead
+ * emulator on the same serial makes the controller dial a closed gRPC port
+ * ("Connection refused" on Unix, "actively refused" on Windows), or a port that
+ * something else now holds and never answers on ("did not answer on gRPC port").
+ */
+const EMULATOR_NOT_DISCOVERED =
+  /not found among running emulators|did not answer on gRPC port|Failed to find any running emulator|transport error[\s\S]*tcp connect error: (?:Connection refused|[^\n]*actively refused)/;
+
+const FIRST_FRAME_TIMEOUT_MS = 5_000;
+
+/**
+ * The phone controller prints its readiness lines before the agent injects
+ * input: a touch sent before the first frame is acked but never lands.
+ */
+async function waitForFirstFrame(streamUrl: string): Promise<void> {
+  if (!streamUrl) return;
+  const stream = await openMjpegStream(streamUrl, FIRST_FRAME_TIMEOUT_MS).catch(() => null);
+  if (!stream) return;
+  await stream
+    .waitForFirstFrame(FIRST_FRAME_TIMEOUT_MS)
+    .catch(() => {})
+    .finally(() => stream.close());
+}
+
+type SpawnedServer = Awaited<ReturnType<typeof spawnSimulatorServerProcess>> & {
+  /**
+   * The on-device screen-sharing agent's socket, or null when this session
+   * started none or it cannot be told apart from another one. A promise: the
+   * probe runs after ready and is never awaited before the exit listener is
+   * attached, so an exit during it still reaches the registry.
+   */
+  agentSocket: Promise<string | null>;
+};
+
+const NO_AGENT = Promise.resolve(null);
+
+/**
+ * Only `android_device` leaves a process on the device that can outlive the
+ * binary (#1161). The `adb reverse` agent sockets listed before the spawn are
+ * someone else's; the one new entry after ready is this session's. A spawn that
+ * fails before ready reaps nothing: with no live binary to own a socket, a new
+ * entry could just as well be an Android Studio mirror that started meanwhile.
+ */
+async function spawnAndroidDevice(serial: string): Promise<SpawnedServer> {
+  // Hoisted from the spawn sink: the snapshot puts the serial on an adb argv first.
+  if (!SAFE_SIMULATOR_DEVICE_ID.test(serial)) {
+    throw new Error(`Refusing to start simulator-server for unsafe device id "${serial}".`);
+  }
+  const before = await listAgentReverseSockets(serial);
+  const server = await spawnSimulatorServerProcess(serial, "android_device");
+  const agentSocket = before ? detectAgentSocket(serial, before) : NO_AGENT;
+  return { ...server, agentSocket };
+}
+
+async function spawnWithEmulatorFallback(device: DeviceInfo): Promise<SpawnedServer> {
+  const subcommand = subcommandForDevice(device);
+  if (subcommand === "android_device") return spawnAndroidDevice(device.id);
+  try {
+    return { ...(await spawnSimulatorServerProcess(device.id, subcommand)), agentSocket: NO_AGENT };
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    if (subcommand !== "android" || !EMULATOR_NOT_DISCOVERED.test(message)) throw err;
+    process.stderr.write(
+      `[sim ${device.id}] emulator not found through gRPC discovery; ` +
+        `falling back to the adb screen-sharing controller\n`
+    );
+    const server = await spawnAndroidDevice(device.id);
+    await waitForFirstFrame(server.streamUrl);
+    return server;
+  }
 }
 
 async function spawnSimulatorServerProcess(
@@ -148,9 +433,15 @@ async function spawnSimulatorServerProcess(
     const args = [subcommand, "--id", udid];
     if (deviceSet) args.push("--device-set", deviceSet);
 
+    // The binary finds adb through ANDROID_HOME, so a configured SDK root
+    // reaches it as that variable.
+    const sdkRoot = subcommand === "ios" ? null : getAndroidSdkRoot();
+    if (sdkRoot)
+      process.stderr.write(`[sim ${udid.slice(0, 8)}] android.sdkRoot → ANDROID_HOME=${sdkRoot}\n`);
     const proc = spawn(BINARY_PATH, args, {
       cwd: RUN_DIR,
       stdio: ["pipe", "pipe", "pipe"],
+      ...(sdkRoot ? { env: { ...process.env, ANDROID_HOME: sdkRoot } } : {}),
     });
 
     let apiUrl: string | null = null;
@@ -161,24 +452,46 @@ async function spawnSimulatorServerProcess(
     const STREAM_GRACE_MS = 500;
     let apiReadyTimer: NodeJS.Timeout | null = null;
 
-    const rl = readline.createInterface({ input: proc.stdout! });
-
     const settle = (fn: () => void, cleanup?: () => void) => {
       if (settled) return;
       settled = true;
       clearTimeout(timer);
       if (apiReadyTimer) clearTimeout(apiReadyTimer);
-      rl.close();
+      rl?.close();
       cleanup?.();
       fn();
     };
 
+    proc.on("error", (err) => {
+      settle(() =>
+        reject(
+          new FailureError(
+            err instanceof Error ? err.message : String(err),
+            {
+              error_code: FAILURE_CODES.SIMULATOR_SERVER_PROCESS_ERROR,
+              failure_stage: "simulator_server_spawn_process",
+              failure_area: "tool_server",
+              error_kind: "subprocess",
+              ...subprocessFailureMetadata(err, "simulator_server"),
+            },
+            { cause: err instanceof Error ? err : new Error(String(err)) }
+          )
+        )
+      );
+    });
+
+    const rl = proc.stdout ? readline.createInterface({ input: proc.stdout }) : null;
+
+    // Set on `exit`, before the rejection waits for stderr: stdout can still
+    // deliver buffered readiness lines, and an exited process is never ready.
+    let exited = false;
+
     const resolveWhenReady = () => {
-      if (apiUrl == null) return;
+      if (apiUrl == null || exited) return;
       settle(() => resolve({ proc, apiUrl: apiUrl!, streamUrl }));
     };
 
-    rl.on("line", (rawLine: string) => {
+    rl?.on("line", (rawLine: string) => {
       const line = rawLine.trim();
       if (line.startsWith("stream_ready ")) {
         const match = line.match(/(http:\/\/[^ ]+)/);
@@ -199,49 +512,61 @@ async function spawnSimulatorServerProcess(
     });
 
     const udidTag = typeof udid === "string" && udid.length > 0 ? udid.slice(0, 8) : "?";
+    // The binary explains a failed start on stderr (e.g. "Error: Failed to find
+    // any running emulator"), so keep the last lines for the rejection below.
+    const stderrTail: string[] = [];
+    let partialLine = "";
+    // Routine lines are dropped here, not when the message is built, so a burst
+    // of shutdown logging cannot push the error out of the tail.
+    const keepLine = (line: string) => {
+      if (!line.trim() || ROUTINE_LOG_LINE.test(line)) return;
+      stderrTail.push(line.trimEnd().slice(0, STDERR_MAX_LINE_CHARS));
+      stderrTail.splice(0, Math.max(0, stderrTail.length - STDERR_TAIL_LINES));
+    };
     proc.stderr?.on("data", (data: Buffer) => {
       process.stderr.write(`[sim ${udidTag}] ${data}`);
+      if (settled) return;
+      const lines = (partialLine + data.toString()).split("\n");
+      partialLine = (lines.pop() ?? "").slice(-STDERR_MAX_LINE_CHARS);
+      lines.forEach(keepLine);
     });
 
     proc.on("exit", (code, signal) => {
-      settle(() =>
-        reject(
-          new FailureError("simulator-server exited with code before becoming ready", {
-            error_code: FAILURE_CODES.SIMULATOR_SERVER_READY_EXITED,
-            failure_stage: "simulator_server_spawn_ready",
-            failure_area: "tool_server",
-            error_kind: "subprocess",
-            failure_command: "simulator_server",
-            ...(typeof code === "number" ? { failure_exit_code: code } : {}),
-            ...(signal === "SIGABRT" ||
-            signal === "SIGHUP" ||
-            signal === "SIGINT" ||
-            signal === "SIGKILL" ||
-            signal === "SIGQUIT" ||
-            signal === "SIGTERM"
-              ? { failure_signal: signal }
-              : {}),
-          })
-        )
-      );
-    });
-
-    proc.on("error", (err) => {
-      settle(() =>
-        reject(
-          new FailureError(
-            err instanceof Error ? err.message : String(err),
-            {
-              error_code: FAILURE_CODES.SIMULATOR_SERVER_PROCESS_ERROR,
-              failure_stage: "simulator_server_spawn_process",
+      exited = true;
+      // The ready deadline must not fire during the stderr wait and replace the
+      // exit code and reason with a timeout.
+      clearTimeout(timer);
+      const fail = () => {
+        keepLine(partialLine);
+        partialLine = "";
+        settle(() =>
+          reject(
+            new FailureError(exitedBeforeReadyMessage(code, signal, stderrTail), {
+              error_code: FAILURE_CODES.SIMULATOR_SERVER_READY_EXITED,
+              failure_stage: "simulator_server_spawn_ready",
               failure_area: "tool_server",
               error_kind: "subprocess",
-              ...subprocessFailureMetadata(err, "simulator_server"),
-            },
-            { cause: err instanceof Error ? err : new Error(String(err)) }
+              failure_command: "simulator_server",
+              ...(typeof code === "number" ? { failure_exit_code: code } : {}),
+              ...(signal === "SIGABRT" ||
+              signal === "SIGHUP" ||
+              signal === "SIGINT" ||
+              signal === "SIGKILL" ||
+              signal === "SIGQUIT" ||
+              signal === "SIGTERM"
+                ? { failure_signal: signal }
+                : {}),
+            })
           )
-        )
-      );
+        );
+      };
+      const stderr = proc.stderr;
+      if (settled || !stderr || stderr.readableEnded) return fail();
+      const drainTimer = setTimeout(fail, STDERR_DRAIN_MS);
+      stderr.once("end", () => {
+        clearTimeout(drainTimer);
+        fail();
+      });
     });
 
     const timer = setTimeout(() => {
@@ -261,6 +586,27 @@ async function spawnSimulatorServerProcess(
       );
     }, READY_TIMEOUT_MS);
   });
+}
+
+/**
+ * Keeps the server capturing on demand while a profiler records on the device.
+ * A server without the command rejects it at once, which is ignored. Not for
+ * MoQ, whose control track has no such command.
+ */
+function withCaptureOnDemand(
+  deviceId: string,
+  instance: ServiceInstance<SimulatorServerApi>
+): ServiceInstance<SimulatorServerApi> {
+  const unregister = registerCaptureOnDemandSender(deviceId, instance.api.apiUrl, (enabled) => {
+    sendCommand(instance.api, { cmd: "capture_on_demand", enabled }).catch(() => {});
+  });
+  return {
+    ...instance,
+    dispose: async () => {
+      unregister();
+      await instance.dispose();
+    },
+  };
 }
 
 export const simulatorServerBlueprint: ServiceBlueprint<SimulatorServerApi, DeviceInfo> = {
@@ -308,6 +654,21 @@ export const simulatorServerBlueprint: ServiceBlueprint<SimulatorServerApi, Devi
       );
     }
 
+    /**
+     * Ahead of every platform branch. An external device needs no tvOS probe,
+     * `adb` check or `simctl` bootstrap — its provider already did that setup.
+     *
+     * Resolved under either spelling. Both `ios.additionalDeviceSets` and
+     * `adb devices` make a provider's device reachable by its raw id and
+     * reaching `spawnSimulatorServerProcess` with one is precisely the second
+     * server on an in-use device this whole path exists to prevent.
+     */
+    const claim = externalClaimForAnyId(device.id);
+
+    if (claim) {
+      return withCaptureOnDemand(device.id, await buildAttachedInstance(device, claim));
+    }
+
     if (device.platform === "ios-remote") {
       return buildRemoteInstance(device);
     }
@@ -328,7 +689,9 @@ export const simulatorServerBlueprint: ServiceBlueprint<SimulatorServerApi, Devi
             "presses, and `keyboard` to type (see the argent-tv-interact skill)"
         );
       }
-      await ensureAutomationEnabled(device.id).catch(() => {});
+      // Input could open an app from the home screen, which must not launch
+      // before the watcher has armed native-devtools injection.
+      await Promise.all([clearAutomationEnabledOrWarn(device.id), firstSimulatorPoll()]);
     } else if (device.platform === "android") {
       // Both the emulator and the physical-device controller talk to the target
       // through adb (gRPC bridge / screen-sharing agent respectively).
@@ -342,10 +705,7 @@ export const simulatorServerBlueprint: ServiceBlueprint<SimulatorServerApi, Devi
       );
     }
 
-    const { proc, apiUrl, streamUrl } = await spawnSimulatorServerProcess(
-      device.id,
-      subcommandForDevice(device)
-    );
+    const { proc, apiUrl, streamUrl, agentSocket } = await spawnWithEmulatorFallback(device);
 
     const events = new TypedEventEmitter<ServiceEvents>();
 
@@ -364,20 +724,53 @@ export const simulatorServerBlueprint: ServiceBlueprint<SimulatorServerApi, Devi
       events.emit("terminated", err);
     });
 
-    const instance: ServiceInstance<SimulatorServerApi> = {
-      api: {
-        apiUrl,
-        streamUrl,
-        pressKey: (direction: "Down" | "Up", keyCode: number) => {
-          proc.stdin?.write(`key ${direction} ${keyCode}\n`);
-        },
+    const api: SimulatorServerApi = {
+      apiUrl,
+      streamUrl,
+      deviceId: device.id,
+      /**
+       * Over the WebSocket, not stdin: simulator-server never replies on
+       * stdin, so a stdin write resolved at once and a stalled server let keys
+       * pile up and land in a burst while `keyboard` reported them typed
+       * (#2030). The ack holds each press until the server has taken it, and
+       * a server that stops answering for KEY_ACK_TIMEOUT_MS fails the press
+       * with SIMULATOR_COMMAND_ACK_TIMEOUT.
+       */
+      pressKey: async (direction, keyCode) => {
+        await sendCommand(
+          api,
+          { cmd: "key", code: keyCode, direction },
+          { ackTimeoutMs: KEY_ACK_TIMEOUT_MS }
+        );
       },
+    };
+    let disposed = false;
+    const instance: ServiceInstance<SimulatorServerApi> = {
+      api,
       dispose: async () => {
+        // An explicit stop and a `terminated` teardown can both land here.
+        if (disposed) return;
+        disposed = true;
         proc.kill();
+        // In the background: a phone that stopped answering must not hold the
+        // registry's sequential teardown. Shutdown waits via settleAgentReaps.
+        trackAgentReap(
+          (async () => {
+            const socket = await agentSocket;
+            if (!socket) return;
+            // The binary's own teardown first; then reap unconditionally, for a
+            // binary without one, one wedged past the grace, or a SIGKILL.
+            await waitForExit(proc, EXIT_GRACE_MS);
+            await reapAndroidScreenSharingAgent(device.id, socket);
+          })()
+        );
       },
       events,
     };
 
-    return instance;
+    // The first command a foldable gets must already name its live panel, so
+    // the probe runs before the instance is handed out.
+    await attachFoldableDisplay(instance.api, device);
+    return withCaptureOnDemand(device.id, instance);
   },
 };

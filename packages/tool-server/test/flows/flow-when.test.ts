@@ -12,17 +12,19 @@ import type { DescribeNode, DescribeTreeData } from "../../src/tools/describe/co
 let currentTree: () => DescribeNode;
 let currentHint: string | undefined;
 vi.mock("../../src/tools/flows/flow-tree", () => ({
-  fetchFlowTree: vi.fn(
-    async (): Promise<DescribeTreeData> => ({
-      tree: currentTree(),
-      source: "native-devtools",
-      ...(currentHint !== undefined ? { hint: currentHint } : {}),
-    })
-  ),
+  fetchFlowTree: vi.fn(async (): Promise<DescribeTreeData> => ({
+    tree: currentTree(),
+    source: "native-devtools",
+    ...(currentHint !== undefined ? { hint: currentHint } : {}),
+  })),
 }));
 
 import { createRunFlowTool, type FlowRunResult } from "../../src/tools/flows/flow-run";
+import { describeWhenCondition, summarizeStep } from "../../src/tools/flows/flow-step-definitions";
 import { serializeFlow, parseFlow } from "../../src/tools/flows/flow-utils";
+import { useAutoAdvancingClock } from "../helpers/auto-clock";
+
+useAutoAdvancingClock();
 
 const DEVICE = "00000000-0000-0000-0000-0000000000ab"; // iOS UDID shape
 let tmpDir: string;
@@ -708,6 +710,26 @@ describe("when: execution", () => {
     expect(result.ok).toBe(true);
   });
 
+  it("reports an echo in a skipped block on one line", async () => {
+    await writeFlow("narrated-skip", {
+      executionPrerequisite: "",
+      steps: [
+        {
+          kind: "when",
+          condition: { kind: "platform", platform: "android" },
+          steps: [{ kind: "echo", message: "a\nb\u001b[31m" }],
+        },
+      ],
+    });
+
+    const result = await run("narrated-skip"); // DEVICE is an iOS UDID
+
+    expect(result.steps.map((s) => `${s.kind}:${s.status}:${s.message}`)).toEqual([
+      "when:skip:undefined",
+      "echo:skip:a\\nb\\u001b[31m",
+    ]);
+  });
+
   it("matches a platform guard positively on an android device and skips the ios block", async () => {
     // The inverse orientation of the iOS-udid test above: an android serial
     // (any id that is not a UUID / remote: / chromium-cdp- / amazon- shape
@@ -1199,6 +1221,7 @@ describe("when: run cancellation", () => {
     ]);
     expect(result.steps[0].reason).toBe("run aborted");
     expect(result.steps[0].reason).not.toMatch(/condition not met/);
+    expect(result.steps[0].durationMs).toBeUndefined();
     expect(result.steps[1].reason).toBe("run aborted");
     expect(result.taps).toHaveLength(0);
     expect(result.ok).toBe(false);
@@ -1287,5 +1310,42 @@ describe("when: run cancellation", () => {
     expect(result.ok).toBe(true);
     expect(result.aborted).toBeUndefined();
     expect("aborted" in result).toBe(false);
+  });
+
+  it("pluralizes the skip reason exactly as the recording summary spells the same block", async () => {
+    // The `(N step/N steps)` tail is spelled twice — here in the skip reason
+    // and in flow-step-definitions' when summary. This couples them: an edit
+    // to either spelling that desyncs the two fails this, not a user-facing
+    // drift nobody pinned. BOTH counts run, because a plural-only block leaves
+    // the singular arm free to be hardcoded away on either side.
+    const block = (n: number) => ({
+      kind: "when" as const,
+      condition: {
+        kind: "ui" as const,
+        condition: "visible" as const,
+        selector: { text: "What's new", loose: true },
+      },
+      steps: Array.from({ length: n }, (_, i) => ({
+        kind: "echo" as const,
+        message: `step ${i}`,
+      })),
+    });
+    currentTree = () => screen([]);
+
+    for (const [n, tail] of [
+      [1, "(1 step)"],
+      [2, "(2 steps)"],
+    ] as const) {
+      await writeFlow(`plural-${n}`, { executionPrerequisite: "", steps: [block(n)] });
+
+      const result = await run(`plural-${n}`);
+
+      expect(summarizeStep(block(n), 1).match(/\([^()]*\)$/)?.[0]).toBe(tail);
+      // Whole reason, not a suffix: a compare that only looks at the end passes
+      // on anything appended after the tail.
+      expect(result.steps[0].reason).toBe(
+        `condition not met (${describeWhenCondition(block(n).condition)}) — block skipped ${tail}`
+      );
+    }
   });
 });

@@ -27,7 +27,8 @@ let treeDelayMs = 0;
  */
 let treeHint: string | undefined;
 let treeShouldRestart: boolean | undefined;
-vi.mock("../../src/tools/flows/flow-tree", () => ({
+vi.mock("../../src/tools/flows/flow-tree", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("../../src/tools/flows/flow-tree")>()),
   fetchFlowTree: vi.fn(async (): Promise<DescribeTreeData> => {
     // Pinned to the source this call started against, not to whatever the
     // module-level `currentTree` holds when the delay elapses. A read the
@@ -95,6 +96,9 @@ vi.mock("../../src/tools/flows/flow-pixels", async (importOriginal) => {
 });
 
 import { createRunFlowTool, type FlowRunResult } from "../../src/tools/flows/flow-run";
+import { useAutoAdvancingClock } from "../helpers/auto-clock";
+
+useAutoAdvancingClock();
 
 const DEVICE = "00000000-0000-0000-0000-0000000000ab"; // iOS UDID shape
 let tmpDir: string;
@@ -243,7 +247,16 @@ steps:
   // first read must still be held for it before the step returns. Without that
   // the option means nothing, since three reads take about 400ms whatever it
   // is set to.
+  //
+  // Timed between the READS the hold runs across. That the settle landed
+  // inside the wait needs no clock — every other way out of it carries a
+  // warning.
   it("holds a still screen for the whole requested hold before passing", async () => {
+    const readsAt: number[] = [];
+    currentTree = () => {
+      readsAt.push(Date.now());
+      return screenWith("Home");
+    };
     await writeFlow(
       "ready",
       `executionPrerequisite: ""
@@ -251,13 +264,10 @@ steps:
   - await: { idle: true, timeout: 2500, stableFor: 800 }
 `
     );
-    const started = Date.now();
     const r = await run("ready");
-    const elapsed = Date.now() - started;
     expect(r.steps.at(-1)).toMatchObject({ kind: "idle", status: "pass" });
     expect(r.steps.at(-1)!.warning).toBeUndefined();
-    expect(elapsed).toBeGreaterThanOrEqual(750);
-    expect(elapsed).toBeLessThan(2_400);
+    expect(readsAt.at(-1)! - readsAt[0]!).toBeGreaterThanOrEqual(750);
   });
 
   // The floor the parser enforces has to be one the runner can serve, or the
@@ -266,6 +276,11 @@ steps:
   // 1400ms, while the settle lands at ~820ms because the hold is counted
   // across the polls rather than after them.
   it("settles inside the smallest timeout the parser allows for the hold", async () => {
+    const readsAt: number[] = [];
+    currentTree = () => {
+      readsAt.push(Date.now());
+      return screenWith("Home");
+    };
     await writeFlow(
       "ready",
       `executionPrerequisite: ""
@@ -274,16 +289,15 @@ steps:
   - echo: reached
 `
     );
-    const started = Date.now();
     const r = await run("ready");
-    const elapsed = Date.now() - started;
     expect(r.ok).toBe(true);
     const step = r.steps.find((s) => s.kind === "idle")!;
     expect(step.status).toBe("pass");
-    // A clean settle, not a step that ran out of budget and warned its way out.
+    // A clean settle, not a step that ran out of budget and warned its way out
+    // — which is also what says it fitted inside the 1000ms wait.
     expect(step.warning).toBeUndefined();
-    expect(elapsed).toBeGreaterThanOrEqual(750);
-    expect(elapsed).toBeLessThan(1_000);
+    // And the hold was served, not skipped (timed between reads: see above).
+    expect(readsAt.at(-1)! - readsAt[0]!).toBeGreaterThanOrEqual(750);
     expect(r.steps.at(-1)).toMatchObject({ kind: "echo", status: "pass" });
   });
 
@@ -534,15 +548,15 @@ steps:
   // most settled screen there is — every read answering with the same tree —
   // whenever the closing round happened to start with 2s in hand.
   it("does not call a slow but answering source a wedged one", async () => {
-    // 2300ms reads in a 4600ms wait: the first answers, the second is cut off
-    // with 2100ms of budget — over the hung threshold, and under what this
+    // 2800ms reads in a 5400ms wait: the first answers, the second is cut off
+    // with 2400ms of budget — over the hung threshold, and under what this
     // source has already been seen to need.
-    treeDelayMs = 2_300;
+    treeDelayMs = 2_800;
     await writeFlow(
       "ready",
       `executionPrerequisite: ""
 steps:
-  - await: { idle: true, timeout: 4600, stableFor: 0 }
+  - await: { idle: true, timeout: 5400, stableFor: 0 }
   - echo: reached
 `
     );
@@ -553,7 +567,7 @@ steps:
     // Not the wedged-source verdict, in whichever field it would have landed.
     expect(`${step.reason ?? ""} ${step.warning ?? ""}`).not.toContain("answered and then stopped");
     // What it actually was: too few looks to judge the screen by.
-    expect(step.warning).toContain("content on 1 read in 4600ms");
+    expect(step.warning).toContain("content on 1 read in 5400ms");
     expect(r.steps.at(-1)).toMatchObject({ kind: "echo", status: "pass" });
   });
 
@@ -633,12 +647,16 @@ steps:
   // reported as having settled.
   it("does not report a tree-only settle when the hold was never served", async () => {
     currentFrame = () => undefined;
-    // The tree keeps changing for the first 700ms, then holds. The last read
-    // lands ~1200ms in, so the hierarchy has been still for well under the
-    // 800ms hold, however many agreeing intervals it managed.
-    const startedAt = Date.now();
+    // The tree keeps changing for the first 800ms of the WAIT, counted from the
+    // first read. It holds after that, and the last read lands ~1400ms in, so
+    // the hierarchy has been still for well under the 800ms hold, however many
+    // agreeing intervals it managed.
+    let firstReadAt: number | undefined;
     let churn = 0;
-    currentTree = () => screenWith(Date.now() - startedAt < 700 ? `Loading ${churn++}` : "Settled");
+    currentTree = () => {
+      firstReadAt ??= Date.now();
+      return screenWith(Date.now() - firstReadAt < 800 ? `Loading ${churn++}` : "Settled");
+    };
     await writeFlow(
       "ready",
       `executionPrerequisite: ""
@@ -742,9 +760,7 @@ steps:
     // Captures did go missing; the point is that they cost only their own
     // interval.
     expect(captures).toBeGreaterThan(3);
-    // Room for the pre-fix behaviour — burning the whole 6000ms wait — to be
-    // reported as the failed assertion it is rather than as a harness timeout.
-  }, 15_000);
+  });
 
   // The other half of that, and the reason a missing frame is never simply
   // waved through: it is the ABSENCE of visual evidence, and treating it as
@@ -1196,10 +1212,13 @@ steps:
   });
 
   it("stops on abort without judging the screen", async () => {
-    let tick = 0;
-    currentTree = () => screenWith(`frame ${tick++}`); // never settles
     const controller = new AbortController();
-    setTimeout(() => controller.abort(), 300);
+    let tick = 0;
+    // Never settles; aborted from the third read, so the abort lands mid-wait.
+    currentTree = () => {
+      if (tick === 2) controller.abort();
+      return screenWith(`frame ${tick++}`);
+    };
     await writeFlow(
       "ready",
       `executionPrerequisite: ""
@@ -1250,19 +1269,26 @@ steps:
   // churning — which is precisely the regression this step exists to catch.
   it("does not pass on a screen that settled early and then started moving again", async () => {
     currentFrame = () => undefined; // force the tree-only path
+    // Three still reads set the verdict — two agreeing intervals is what it
+    // takes — and everything after them moves, so the case needs a fourth read
+    // to show the movement; the assertion on `reads` below separates a run that
+    // never saw movement from a latch that failed to clear.
     let reads = 0;
     currentTree = () => {
       reads += 1;
-      return reads <= 4 ? screenWith("Home") : screenWith(`churn ${reads}`);
+      return reads <= 3 ? screenWith("Home") : screenWith(`churn ${reads}`);
     };
     await writeFlow(
       "ready",
       `executionPrerequisite: ""
 steps:
-  - await: { idle: true, timeout: 2500, stableFor: 0 }
+  - await: { idle: true, timeout: 6000, stableFor: 0 }
 `
     );
     const r = await run("ready");
+    expect(reads, "reads served — under four, nothing moved to be judged").toBeGreaterThanOrEqual(
+      4
+    );
     expect(r.steps.at(-1)!.warning).toContain("never held still");
   });
 
@@ -1270,19 +1296,26 @@ steps:
   // ready. A blank tree is an observation, not a gap — it clears the verdict.
   it("does not pass on a screen that settled early and then went blank", async () => {
     currentFrame = () => undefined;
+    // Three still reads, then blank, sized and guarded the same way as the
+    // case above.
     let reads = 0;
     currentTree = () => {
       reads += 1;
-      return reads <= 4 ? screenWith("Home") : n({ role: "AXWindow", frame: FULL, children: [] });
+      return reads <= 3 ? screenWith("Home") : n({ role: "AXWindow", frame: FULL, children: [] });
     };
     await writeFlow(
       "ready",
       `executionPrerequisite: ""
 steps:
-  - await: { idle: true, timeout: 2500, stableFor: 0 }
+  - await: { idle: true, timeout: 6000, stableFor: 0 }
 `
     );
-    expect((await run("ready")).steps.at(-1)!.warning).toContain("never held still");
+    const r = await run("ready");
+    expect(
+      reads,
+      "reads served — under four, nothing went blank to be judged"
+    ).toBeGreaterThanOrEqual(4);
+    expect(r.steps.at(-1)!.warning).toContain("never held still");
   });
 
   // H3: bounding the tree read by the remaining budget made the LAST read

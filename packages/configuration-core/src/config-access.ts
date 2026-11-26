@@ -6,7 +6,7 @@
 
 import * as path from "node:path";
 import { resolveProjectRoot, type FlagScope } from "./flags.js";
-import { resolveHomeDir, type ConfigPathOptions } from "./paths.js";
+import { isHomeDir, resolveHomeDir, type ConfigPathOptions } from "./paths.js";
 import { readConfigObject, updateConfig, getAtPath, setAtPath, deleteAtPath } from "./config.js";
 import { applyMergePolicy } from "./merge.js";
 import {
@@ -201,6 +201,8 @@ export function listConfig(
   options: ConfigPathOptions = {},
   registry: readonly ConfigDefinition[] = CONFIG_SCHEMA
 ): ConfigEntryView[] {
+  // A home-rooted project's file is the global one: list its values once, as global.
+  const projectIsHome = isHomeDir(resolveProjectRoot(options.cwd ?? process.cwd()), options);
   return registry.map((def) => ({
     key: def.key,
     description: def.description,
@@ -209,7 +211,7 @@ export function listConfig(
     ...(describeExpectedValue(def) ? { expected: describeExpectedValue(def)! } : {}),
     ...(def.example ? { example: def.example } : {}),
     effective: getConfigValue(def, options),
-    project: readScopeValue(def, "project", options),
+    project: projectIsHome ? undefined : readScopeValue(def, "project", options),
     global: readScopeValue(def, "global", options),
   }));
 }
@@ -245,6 +247,26 @@ export function clearRememberedAgent(options: ConfigPathOptions = {}): void {
   unsetConfigValue(LENS_AGENT_KEY, "global", options);
 }
 
+const ANDROID_SDK_ROOT_KEY = "android.sdkRoot";
+
+/** The configured Android SDK root as an absolute path (`~` expanded), or null when unset. */
+export function getAndroidSdkRoot(options: ConfigPathOptions = {}): string | null {
+  const value = getConfigValueByKey(ANDROID_SDK_ROOT_KEY, options);
+  if (typeof value !== "string") return null;
+  const home = resolveHomeDir(options);
+  if (value === "~") return path.resolve(home);
+  if (value.startsWith("~/")) return path.resolve(home, value.slice(2));
+  return path.resolve(value);
+}
+
+const ANDROID_ADB_SERVER_PORT_KEY = "android.adbServerPort";
+
+/** The configured adb server port, or null when unset. */
+export function getAndroidAdbServerPort(options: ConfigPathOptions = {}): number | null {
+  const value = getConfigValueByKey(ANDROID_ADB_SERVER_PORT_KEY, options);
+  return typeof value === "number" ? value : null;
+}
+
 const IOS_ADDITIONAL_DEVICE_SETS_KEY = "ios.additionalDeviceSets";
 
 /**
@@ -265,10 +287,12 @@ export function getAdditionalIosDeviceSets(options: ConfigPathOptions = {}): str
     );
   }
   const home = resolveHomeDir(options);
+  const projectRoot = resolveProjectRoot(options.cwd ?? process.cwd());
   const global = resolveDeviceSetEntries(readScopeValue(def, "global", options), home, home);
   const project = resolveDeviceSetEntries(
     readScopeValue(def, "project", options),
-    resolveProjectRoot(options.cwd ?? process.cwd()),
+    // A home-rooted project reads the global file; HOME's spelling lets the dedupe drop it.
+    isHomeDir(projectRoot, options) ? home : projectRoot,
     home
   );
   return Array.from(new Set([...global, ...project]));

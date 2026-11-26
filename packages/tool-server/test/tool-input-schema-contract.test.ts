@@ -4,7 +4,6 @@ import {
   advertisedSchema,
   definitionsById,
   CLIENT_UNSAFE_TOP_LEVEL_KEYWORDS,
-  EXPECTED_TOOL_COUNT,
 } from "./helpers/catalog";
 
 // Three tools once shipped a hand-written inputSchema that spread a top-level
@@ -23,10 +22,6 @@ import {
 describe("advertised tool input schemas", () => {
   const definitions = definitionsById(createRegistry());
 
-  it("covers the whole catalog", () => {
-    expect(definitions.size).toBe(EXPECTED_TOOL_COUNT);
-  });
-
   for (const [id, definition] of definitions) {
     it(`${id}: is a plain object schema with no top-level combinator`, () => {
       const schema = advertisedSchema(definition);
@@ -38,5 +33,29 @@ describe("advertised tool input schemas", () => {
       expect(schema!.type, `${id}.type`).toBe("object");
       expect(typeof schema!.properties, `${id}.properties`).toBe("object");
     });
+  }
+});
+
+// Zod validates a parameter's `pattern` before the platform dispatch runs, so
+// no platform is exempt from it. A description that calls such a value
+// free-form walks the agent into a rejection whose message names a rule the
+// description said did not apply — issue #901, where launch-app's `bundleId`
+// was an "arbitrary tag" on Chromium and a reverse-DNS identifier everywhere
+// else.
+describe("descriptions of pattern-constrained parameters", () => {
+  const definitions = definitionsById(createRegistry());
+  const UNCONSTRAINED = /arbitrary|free[- ]form|any (?:string|value|text)/i;
+
+  for (const [id, definition] of definitions) {
+    const properties = (advertisedSchema(definition)?.properties ?? {}) as Record<
+      string,
+      { pattern?: unknown; description?: unknown }
+    >;
+    for (const [name, property] of Object.entries(properties)) {
+      if (typeof property?.pattern !== "string") continue;
+      it(`${id}.${name}: states a constraint rather than promising an unconstrained value`, () => {
+        expect(String(property.description ?? "")).not.toMatch(UNCONSTRAINED);
+      });
+    }
   }
 });

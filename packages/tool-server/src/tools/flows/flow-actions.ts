@@ -6,14 +6,16 @@ import {
   type DescribeSource,
   type DescribeTreeData,
 } from "../describe/contract";
+import { isBlindRead } from "../describe/blind-read";
 import {
-  selectorToFrame,
+  selectorToNode,
   findAll,
   evaluateCondition,
-  firstInReadingOrder,
+  textCheckTarget,
   frameContains,
   isVisible,
   assertText,
+  macFieldText,
   nodeText,
   treeFingerprint,
   type Selector,
@@ -22,8 +24,11 @@ import {
 } from "../../utils/ui-tree-match";
 import { settleWithin, sleepOrAbort } from "../../utils/timing";
 import { invokeSubTool } from "../../utils/sub-invoke";
+import { renderFlagGated } from "../../utils/flag-gated-text";
+import { isFlagOffered } from "../../utils/capability";
 import { bindDeviceArgs } from "./flow-device";
 import { fetchFlowTree, supportsFlowTree } from "./flow-tree";
+import { quotedText } from "../../utils/typed-secrets";
 import {
   capturePixelsWithin,
   comparePixels,
@@ -139,6 +144,11 @@ export interface ActionEnv {
    * `ActionEnv` by hand, which leaves every settle on its own budget.
    */
   treeOutage?: { proven?: { deviceId: string; error: Error } };
+  /**
+   * When the run's last step that can change the screen ended (`Date.now()`).
+   * A `snapshot` keeps settling until a quiet window past it has elapsed.
+   */
+  lastActionAt?: number;
 }
 
 /** Outcome of a selector directive: ok, or a machine-readable reason it failed. */
@@ -221,14 +231,33 @@ const POLL_INTERVAL_MS = 300;
 const TYPE_FOCUS_SETTLE_MS = 500;
 const TYPE_FOCUS_TIMEOUT_MS = 3000;
 
-// Tree sources that surface `focused`. A source outside this set (Vega's
-// toolkit page source) never reports it, so polling would burn the whole
-// timeout on every type step — skip the focus wait there instead.
+// Tree sources whose `focused` flag the focus wait may poll. A source outside
+// the set gets one look and then bails, leaving typing only the fixed
+// TYPE_FOCUS_SETTLE_MS head start. Both exclusions are deliberate:
+//
+// - Vega's toolkit page source never reports `focused`; polling would burn
+//   the whole timeout on every type step.
+// - "xcuitest-runner" emits focused, but first-responder handoff on hardware is unverified. Keep the fixed settle.
+//
+// Both macOS sources poll: on a Mac app the focused field was in the tree for
+// 24 of 24 `type` steps, with the screen locked and unlocked.
 const FOCUS_REPORTING_SOURCES: ReadonlySet<DescribeSource> = new Set([
   "native-devtools",
   "android-devtools",
   "cdp-dom",
+  "macos-devtools",
+  "macos-fallback",
 ]);
+
+/**
+ * A device driven with a mouse and wheel rather than touch: a Chromium app or a
+ * native Mac app. Neither takes `gesture-swipe` or `gesture-custom`, so the
+ * directives below send these devices `gesture-scroll` (scroll-to) and
+ * `gesture-drag` (swipe, long-press), and refuse the two-finger gestures.
+ */
+function isPointerDesktop(device: DeviceInfo): boolean {
+  return device.platform === "chromium" || device.platform === "macos";
+}
 
 // Re-read the tree until two consecutive reads match, so a tap never lands
 // mid-fling and a resolved frame can't go stale before we act.
@@ -400,13 +429,17 @@ function flowFindAll(tree: DescribeNode, sel: FlowSelector): DescribeNode[] {
   return fallback;
 }
 
-/** Identifier-first-then-text frame resolution for a (possibly loose) selector. */
-function flowSelectorToFrame(tree: DescribeNode, sel: FlowSelector): DescribeFrame | undefined {
+/** Identifier-first-then-text resolution for a (possibly loose) selector. */
+function flowSelectorToNode(tree: DescribeNode, sel: FlowSelector): DescribeNode | undefined {
   for (const s of selectorAlternatives(sel)) {
-    const frame = selectorToFrame(tree, s);
-    if (frame) return frame;
+    const node = selectorToNode(tree, s);
+    if (node) return node;
   }
   return undefined;
+}
+
+function flowSelectorToFrame(tree: DescribeNode, sel: FlowSelector): DescribeFrame | undefined {
+  return flowSelectorToNode(tree, sel)?.frame;
 }
 
 /**
@@ -662,31 +695,60 @@ interface ScrollResolve {
   reason?: string;
   /** The run was cancelled mid-scroll. */
   aborted?: boolean;
+  /** What the scroll gestures had to say (see {@link toolWarning}). */
+  warning?: string;
+}
+
+// gesture-scroll's refusal on a Mac app at a point where nothing scrolls.
+const NO_SCROLLABLE_VIEW = /No scrollable view at the point/;
+
+/**
+ * How far `frame`'s edge opposite the reveal sits inside `clip`: the most a
+ * scroll toward `direction` can move it before that edge is cut.
+ */
+function leadingRoom(
+  frame: DescribeFrame,
+  clip: DescribeFrame,
+  direction: ScrollDirection
+): number {
+  switch (direction) {
+    case "down":
+      return frame.y - clip.y;
+    case "up":
+      return clip.y + clip.height - (frame.y + frame.height);
+    case "right":
+      return frame.x - clip.x;
+    case "left":
+      return clip.x + clip.width - (frame.x + frame.width);
+  }
 }
 
 /**
- * Dispatch one momentum-free scroll increment anchored at the center of
- * `region`. The anchor (the touch-down / wheel point) is what selects the scroll
+ * Dispatch one momentum-free scroll increment anchored at `anchor`, else at the
+ * center of `region`. The anchor (the touch-down / wheel point) is what selects the scroll
  * container — the OS routes the gesture to the innermost scroller hit-tested
  * there — so anchoring inside a `within` region is how nested scrollers are
  * disambiguated. The travel is half the region along the axis (only the end
  * point is clamped, so the down stays at the anchor and keeps latching to the
  * right container), sized to the clip window rather than the screen so
- * consecutive views of a small container's content still overlap. Touch
- * platforms use a `momentum: false` swipe (no fling); Chromium uses wheel
- * events.
+ * consecutive views of a small container's content still overlap, and at most
+ * `limit`. Touch platforms use a `momentum: false` swipe (no fling); the pointer
+ * desktops (Chromium, macOS) use `gesture-scroll`, whose deltas are the same
+ * fractions of the window.
  */
 async function scrollIncrement(
   env: ActionEnv,
   direction: ScrollDirection,
-  region: DescribeFrame
-): Promise<void> {
-  const cx = clamp01(region.x + region.width / 2);
-  const cy = clamp01(region.y + region.height / 2);
+  region: DescribeFrame,
+  limit = Infinity,
+  anchor: { x: number; y: number } | undefined = undefined
+): Promise<string | undefined> {
+  const cx = clamp01(anchor ? anchor.x : region.x + region.width / 2);
+  const cy = clamp01(anchor ? anchor.y : region.y + region.height / 2);
   const extent = direction === "up" || direction === "down" ? region.height : region.width;
-  const dist = Math.min(SCROLL_INCREMENT, Math.max(MIN_SCROLL_INCREMENT, extent / 2));
+  const dist = Math.min(limit, SCROLL_INCREMENT, Math.max(MIN_SCROLL_INCREMENT, extent / 2));
 
-  if (env.device.platform === "chromium") {
+  if (isPointerDesktop(env.device)) {
     // Positive deltaY/deltaX reveals content below / to the right (see gesture-scroll).
     const delta =
       direction === "down"
@@ -696,8 +758,7 @@ async function scrollIncrement(
           : direction === "right"
             ? { deltaX: dist }
             : { deltaX: -dist };
-    await invokeOnDevice(env, "gesture-scroll", { x: cx, y: cy, ...delta });
-    return;
+    return toolWarning(await invokeOnDevice(env, "gesture-scroll", { x: cx, y: cy, ...delta }));
   }
 
   // To reveal content below the fold the finger travels UP (toY < fromY), etc.
@@ -717,18 +778,20 @@ async function scrollIncrement(
       break;
   }
   try {
-    await invokeOnDevice(env, "gesture-swipe", {
-      fromX: cx,
-      fromY: cy,
-      toX: to.x,
-      toY: to.y,
-      momentum: false,
-      durationMs: 600,
-    });
+    return toolWarning(
+      await invokeOnDevice(env, "gesture-swipe", {
+        fromX: cx,
+        fromY: cy,
+        toX: to.x,
+        toY: to.y,
+        momentum: false,
+        durationMs: 600,
+      })
+    );
   } catch (err) {
     // The tool rejects when cancelled mid-gesture. Let scrollToVisible's next
     // abort check produce the uniform aborted skip instead of surfacing that.
-    if (env.signal?.aborted) return;
+    if (env.signal?.aborted) return undefined;
     throw err;
   }
 }
@@ -754,29 +817,80 @@ async function scrollToVisible(
   within: FlowSelector | undefined
 ): Promise<ScrollResolve> {
   let prevFp: string | undefined;
+  let prevShown: number | undefined;
+  // Whether the walker's anchor is spent: a wheel there left the cut in place.
+  let anchorSpent = false;
+  let warning: string | undefined;
   for (let i = 0; i < MAX_SCROLL_ITERATIONS; i++) {
     if (env.signal?.aborted) return { aborted: true };
 
     const tree = await settleTree(env);
     if (!tree) return { aborted: true }; // settleTree only returns undefined on abort
 
-    // Anchor the gesture inside the container (so the right nested scroller
-    // moves), or over the whole screen when none is named. Its frame is also the
-    // clip window the axis check measures the target against.
-    const region = within ? flowSelectorToFrame(tree, within) : FULL_SCREEN;
-    if (!region) {
-      return { reason: `scroll container ${describeSelector(within!)} is not visible` };
+    // A target a scroll container cuts along the axis is scrolled inside that
+    // scroller, whether or not the tree has a node for it: the gesture is anchored
+    // where the walker found a wheel moves it against a cutting scroller (`clipAnchors`),
+    // and its region is the cutting window along the axis. A gesture anchored
+    // elsewhere moves another scroller, or what holds this one, carrying the cut
+    // along. Any other gesture is anchored inside the
+    // container (so the right nested scroller moves), or spans the whole screen
+    // when none is named. The axis check measures the target against the window
+    // that cuts it along the axis, else the one the container clips its content
+    // to, else the container's frame. A target clear of its cutting window that the
+    // container still cuts is scrolled as an uncut one: the window leaves out boxes
+    // inside its scroller that clip without scrolling natively (one moved by its own
+    // wheel listener), and a wheel at the anchor carries such a box along.
+    const container = within ? flowSelectorToNode(tree, within) : undefined;
+    if (within && !container) {
+      return { reason: `scroll container ${describeSelector(within)} is not visible` };
     }
-
-    const frame = flowSelectorToFrame(tree, target);
-    if (frame && axisFullyInside(frame, direction, region)) return { frame };
+    const targetNode = flowSelectorToNode(tree, target);
+    const frame = targetNode?.frame;
+    const cut = frame && targetNode.clipBounds;
+    const vertical = direction === "up" || direction === "down";
+    const withinCut =
+      cut &&
+      container &&
+      axisFullyInside(frame, direction, cut) &&
+      !axisFullyInside(frame, direction, container.clipFrame ?? container.frame);
+    const anchor = cut && !withinCut ? targetNode.clipAnchors?.[vertical ? "y" : "x"] : undefined;
+    const axisCut = anchor ? cut : undefined;
+    const region =
+      frame && axisCut
+        ? vertical
+          ? { x: frame.x, y: axisCut.y, width: frame.width, height: axisCut.height }
+          : { x: axisCut.x, y: frame.y, width: axisCut.width, height: frame.height }
+        : (container?.frame ?? FULL_SCREEN);
+    if (frame && axisFullyInside(frame, direction, axisCut ?? container?.clipFrame ?? region)) {
+      return { frame, ...warnedBy(warning) };
+    }
+    // How far the target reaches into its window from the cutting edge changes only
+    // when its scroller moves, not when a wheel carries the window along (the page, a
+    // scroller holding the cutter). A cut the last increment left in place is one a
+    // wheel at the anchor cannot scroll away (its scroller is at its end, or a wheel
+    // taker the walker cannot see holds the anchor, such as a page's wheel listener):
+    // it is accepted where it is, after one more increment at the centre of the
+    // `within` container, else of the window that cuts it. A cut that one leaves in
+    // place too is accepted, so the page takes at most two wheels. So is a cut whose
+    // target lies under that centre on the round its anchor is spent: a wheel there
+    // could scroll the target's own content instead of its window. Later increments
+    // go there regardless, so a scrollable target the retry carries under it can
+    // still take one.
+    const room = frame && axisCut ? leadingRoom(frame, axisCut, direction) : undefined;
+    const shown = room === undefined ? undefined : (vertical ? region.height : region.width) - room;
+    let spentNow = false;
+    if (shown !== undefined && prevShown !== undefined && Math.abs(shown - prevShown) < 1e-4) {
+      if (anchorSpent) return { frame: frame!, ...warnedBy(warning) };
+      anchorSpent = spentNow = true;
+    }
+    prevShown = shown;
 
     // Fingerprint only the scrolled content: a continuously-animating node
     // outside it (a spinner, a ticking clock) would keep a wider fingerprint
     // changing on every read, so a container that stopped moving would never
     // read as "end of scroll" and the loop would burn all its iterations. The
-    // scope is the `within` region when one is named, otherwise the union of the
-    // visible scroll containers under the gesture anchor (not the innermost; see
+    // scope is \`region\` when \`within\` is named, otherwise the union of the
+    // visible scroll containers under region's centre (not the innermost; see
     // anchorScrollFrames). Only when the tree surfaces none there does the scope
     // stay the whole screen, where a screen-level animator can still mask
     // end-of-scroll and the loop falls back to the iteration cap. Text stays in
@@ -787,19 +901,44 @@ async function scrollToVisible(
     const scope = within ? [region] : anchorScrollFrames(tree, getDescribeTapPoint(region));
     if (scope.length === 0) scope.push(FULL_SCREEN);
     const fp = treeFingerprint(tree, (node) => scope.some((r) => framesOverlap(node.frame, r)));
-    if (prevFp !== undefined && fp === prevFp) {
+    // A wheel taker the tree cannot see leaves the fingerprint as it was too.
+    if (!spentNow && prevFp !== undefined && fp === prevFp) {
       // End of the scroll — accept the target wherever it landed (best effort).
-      if (frame) return { frame };
+      if (frame) return { frame, ...warnedBy(warning) };
       return {
         reason: `reached the end of the scroll without finding ${describeSelector(target)}`,
+        ...warnedBy(warning),
       };
     }
     prevFp = fp;
 
-    await scrollIncrement(env, direction, region);
+    // A cut target moves no further than its visible start is from the
+    // window's, or one taller than half the window would be carried past it.
+    const retry = container?.frame ?? region;
+    const retryAt = getDescribeTapPoint(retry);
+    if (spentNow && frame && axisCut && frameContains(frame, retryAt.x, retryAt.y)) {
+      return { frame, ...warnedBy(warning) };
+    }
+    try {
+      const sent = anchorSpent
+        ? await scrollIncrement(env, direction, retry, room)
+        : await scrollIncrement(env, direction, region, room, anchor);
+      warning ??= sent;
+    } catch (err) {
+      if (!(err instanceof Error && NO_SCROLLABLE_VIEW.test(err.message))) throw err;
+      if (frame) return { frame, ...warnedBy(warning) };
+      return {
+        reason:
+          `nothing scrolls at the centre of ${within ? describeSelector(within) : "the screen"}, ` +
+          `so ${describeSelector(target)} cannot be scrolled into view; name its scroll ` +
+          "container in within:",
+        ...warnedBy(warning),
+      };
+    }
   }
   return {
     reason: `${describeSelector(target)} not found after ${MAX_SCROLL_ITERATIONS} scroll attempts`,
+    ...warnedBy(warning),
   };
 }
 
@@ -834,16 +973,73 @@ export async function runDirective(env: ActionEnv, step: DirectiveStep): Promise
       reason: `${step.kind} is a touch directive and Vega is remote-driven — move focus with \`tool: tv-remote\` steps (and type via \`tool: keyboard\`) instead`,
     };
   }
-  // Chromium: not "no backend" — CDP can dispatch two-finger touch, but a
-  // mouse-driven desktop app has no uniform pinch-zoom mapping (and no
+  // The pointer desktops refuse both two-finger gestures, before the auto-wait
+  // and before any input. Not "no backend" - CDP can dispatch two-finger touch,
+  // but a mouse-driven desktop app has no uniform pinch-zoom mapping (and no
   // rotate-gesture idiom at all) for it to hit.
-  if ((step.kind === "pinch" || step.kind === "rotate") && env.device.platform === "chromium") {
+  if ((step.kind === "pinch" || step.kind === "rotate") && isPointerDesktop(env.device)) {
+    const platform = env.device.platform;
     return {
       ok: false,
       reason:
         step.kind === "pinch"
-          ? "pinch is unsupported on chromium — desktop apps have no uniform pinch-zoom mapping (they zoom via ctrl+wheel or their own controls); drive the app's zoom UI with tap/keyboard instead"
-          : "rotate is unsupported on chromium — desktop apps have no rotate-gesture idiom; drive the app's rotate controls with tap/keyboard instead",
+          ? `pinch is unsupported on ${platform} — desktop apps have no uniform pinch-zoom mapping (they zoom via ctrl+wheel, a shortcut or their own controls); drive the app's zoom UI with tap/keyboard instead`
+          : `rotate is unsupported on ${platform} — desktop apps have no rotate-gesture idiom; drive the app's rotate controls with tap/keyboard instead`,
+    };
+  }
+  // HarmonyOS has no hold or arc backend; flow steps skip the capability gate,
+  // so refuse with a reason the author can act on.
+  if (env.device.platform === "harmony" && (step.kind === "long-press" || step.kind === "rotate")) {
+    return {
+      ok: false,
+      reason:
+        step.kind === "long-press"
+          ? "long-press is unsupported on HarmonyOS — `uitest uiInput` has a `longClick` verb, but it takes no hold duration and argent drives holds through `gesture-custom`, which has no HarmonyOS backend; use `tap`"
+          : "rotate is unsupported on HarmonyOS — `uinput -T -m` is the platform's only multi-contact injection and it moves each finger along ONE straight line per call, with no way to chain segments into an arc; drive the app's own rotate control with `tap`, or `pinch`, which is a straight-line gesture and does run here",
+    };
+  }
+  // Reject Mac-only tap options before waiting for the target.
+  if (step.kind === "tap" && step.button === "right" && env.device.platform !== "macos") {
+    const platform = env.device.platform;
+    return {
+      ok: false,
+      reason: renderFlagGated(
+        platform === "chromium"
+          ? `tap with button: right is a mouse right-click<flag:macos-apps>, which argent sends only to a Mac app</flag:macos-apps>; ` +
+              `argent does not support it on chromium yet`
+          : `tap with button: right is a mouse right-click<flag:macos-apps>, which only a Mac app takes</flag:macos-apps>; ` +
+              `${platform} takes none` +
+              // HarmonyOS refuses long-press too.
+              (platform === "harmony"
+                ? ""
+                : ". On a touch screen, open a context menu with long-press"),
+        isFlagOffered
+      ),
+    };
+  }
+  if (step.kind === "tap" && step.modifiers !== undefined && env.device.platform !== "macos") {
+    const platform = env.device.platform;
+    return {
+      ok: false,
+      reason: renderFlagGated(
+        platform === "chromium"
+          ? `tap with modifiers holds keyboard keys through a mouse click<flag:macos-apps>, which argent sends only to a Mac app</flag:macos-apps>; ` +
+              `argent does not support it on chromium yet`
+          : `tap with modifiers holds keyboard keys through a mouse click<flag:macos-apps>, which only a Mac app takes</flag:macos-apps>; ` +
+              `${platform} takes none`,
+        isFlagOffered
+      ),
+    };
+  }
+  // Without a flow tree source, idle can never be judged.
+  if (step.kind === "idle" && !supportsFlowTree(env.device.platform)) {
+    return {
+      ok: false,
+      indeterminate: true,
+      reason:
+        `\`await: { idle }\` cannot run on ${env.device.platform}: e2e tests have no UI-tree source on ` +
+        `this platform, so screen stillness can never be judged. Replace this step with an explicit ` +
+        `\`wait:\`.`,
     };
   }
   switch (step.kind) {
@@ -864,7 +1060,7 @@ export async function runDirective(env: ActionEnv, step: DirectiveStep): Promise
     case "scroll-to": {
       const r = await scrollToVisible(env, step.target, step.direction, step.within);
       if (r.aborted) return ABORTED_OUTCOME;
-      return { ok: Boolean(r.frame), reason: r.reason };
+      return { ok: Boolean(r.frame), reason: r.reason, ...warnedBy(r.warning) };
     }
     case "pinch":
       return runPinch(env, step);
@@ -899,11 +1095,6 @@ type GestureSettle = { aborted?: true; warning?: string };
  * coordinates for exactly that reason), so every step of such a flow arrives
  * here and would otherwise be charged a window for the same verdict.
  *
- * A platform with no tree source at all is the one case that settles nothing and
- * reports nothing. `ios-remote` is coordinate-driven by necessity —
- * `fetchFlowTree` serves it no tree — so there is no source to be down and no
- * degradation to warn about, and neither remedy a warning could name exists.
- *
  * The other cost is a screen that never holds still: nothing converges, so every
  * selector-less gesture pays the whole window, and the memo buys no relief
  * because a window that read the tree proves no outage. The fingerprint cannot
@@ -913,8 +1104,6 @@ type GestureSettle = { aborted?: true; warning?: string };
  */
 async function settleForGesture(env: ActionEnv): Promise<GestureSettle> {
   let warning: string | undefined;
-  // A platform with no tree source settles nothing and is warned about nothing;
-  // the abort checkpoint below is owed to the gesture either way.
   if (supportsFlowTree(env.device.platform)) {
     try {
       await settleTree(env, { skipProvenOutage: true });
@@ -933,6 +1122,22 @@ async function settleForGesture(env: ActionEnv): Promise<GestureSettle> {
 /** Spread a settle's warning onto an outcome, leaving no `warning: undefined` key behind. */
 function warned(settle: { warning?: string }): { warning?: string } {
   return settle.warning !== undefined ? { warning: settle.warning } : {};
+}
+
+/**
+ * The warning a dispatched tool's result carries, if any: a gesture on a
+ * foldable whose panel could not be resolved, so it went to the cover panel.
+ * The step owes it to the report like a settle's warning.
+ */
+function toolWarning(result: unknown): string | undefined {
+  const warning = (result as { warning?: unknown } | null | undefined)?.warning;
+  return typeof warning === "string" && warning.length > 0 ? warning : undefined;
+}
+
+/** Every warning a step owes, joined, leaving no `warning: undefined` key behind. */
+function warnedBy(...warnings: Array<string | undefined>): { warning?: string } {
+  const text = warnings.filter((w): w is string => w !== undefined).join(" ");
+  return text.length > 0 ? { warning: text } : {};
 }
 
 /** What a gesture reports when an outage left it unsettled, in the source's own words. */
@@ -995,19 +1200,22 @@ function targetPointFromFrame(
 /**
  * Tap a resolved target point. `times` rides the gesture-tap tool's
  * `clickCount`: one dispatched multi-tap gesture, never N separate calls, whose
- * RPC gaps could fall outside the OS double-tap window.
+ * RPC gaps could fall outside the OS double-tap window. Pass `button` and
+ * `modifiers` through to `gesture-tap`.
  */
 async function runTap(
   env: ActionEnv,
-  target: { selector?: FlowSelector; x?: number; y?: number; times?: number }
+  target: Extract<DirectiveStep, { kind: "tap" }>
 ): Promise<DirectiveOutcome> {
   const resolved = await resolveTargetPoint(env, target);
   if ("fail" in resolved) return resolved.fail;
-  await invokeOnDevice(env, "gesture-tap", {
+  const sent = await invokeOnDevice(env, "gesture-tap", {
     ...resolved.point,
     ...(target.times !== undefined ? { clickCount: target.times } : {}),
+    ...(target.button !== undefined ? { button: target.button } : {}),
+    ...(target.modifiers !== undefined ? { modifiers: target.modifiers } : {}),
   });
-  return { ok: true, ...warned(resolved) };
+  return { ok: true, ...warnedBy(resolved.warning, toolWarning(sent)) };
 }
 
 /**
@@ -1020,11 +1228,12 @@ const DEFAULT_LONG_PRESS_MS = 800;
 /**
  * Press-and-hold on a target (same resolution as tap) for `duration` ms. Touch
  * platforms dispatch ONE `gesture-custom` train (Down, then Up delayed by the
- * duration) so the hold length is exact; Chromium has no touch, so the closest
- * honest mapping is a mouse press-hold-release (`gesture-drag` with from == to)
- * — apps implementing pointer-based long-press respond, anything else sees a
- * slow click. A desktop context menu is a *right*-click, deliberately not
- * aliased here.
+ * duration) so the hold length is exact. On a physical iOS device the train
+ * maps to the runner longPress. The pointer desktops (Chromium, macOS) have no
+ * touch, so the closest honest mapping is a mouse press-hold-release
+ * (`gesture-drag` with from == to) - apps implementing pointer-based long-press
+ * respond, anything else sees a slow click. A desktop context menu is a
+ * *right*-click, deliberately not aliased here.
  */
 async function runLongPress(
   env: ActionEnv,
@@ -1034,7 +1243,8 @@ async function runLongPress(
   if ("fail" in resolved) return resolved.fail;
   const point = resolved.point;
   const duration = step.duration ?? DEFAULT_LONG_PRESS_MS;
-  if (env.device.platform === "chromium") {
+  let sent: unknown;
+  if (isPointerDesktop(env.device)) {
     try {
       await invokeOnDevice(env, "gesture-drag", {
         fromX: point.x,
@@ -1050,14 +1260,14 @@ async function runLongPress(
       throw err;
     }
   } else {
-    await invokeOnDevice(env, "gesture-custom", {
+    sent = await invokeOnDevice(env, "gesture-custom", {
       events: [
         { type: "Down", x: point.x, y: point.y, delayMs: 0 },
         { type: "Up", x: point.x, y: point.y, delayMs: duration },
       ],
     });
   }
-  return { ok: true, ...warned(resolved) };
+  return { ok: true, ...warnedBy(resolved.warning, toolWarning(sent)) };
 }
 
 /**
@@ -1120,12 +1330,14 @@ async function runPinch(
     args[selected.angle === 0 ? "endCenterX" : "endCenterY"] = selected.endCenter;
   }
 
+  let sentWarning: string | undefined;
   for (let i = 0; i < n; i++) {
     if (env.signal?.aborted) return ABORTED_OUTCOME;
-    await invokeOnDevice(env, "gesture-pinch", args);
+    const sent = toolWarning(await invokeOnDevice(env, "gesture-pinch", args));
+    sentWarning ??= sent;
     if (i < n - 1 && !(await sleepOrAbort(PINCH_SETTLE_MS, env.signal))) return ABORTED_OUTCOME;
   }
-  return { ok: true, ...warned(settle) };
+  return { ok: true, ...warnedBy(settle.warning, sentWarning) };
 }
 
 /**
@@ -1223,8 +1435,9 @@ async function runRotate(
   }
 
   if (env.signal?.aborted) return ABORTED_OUTCOME;
+  let sent: unknown;
   try {
-    await invokeOnDevice(env, "gesture-rotate", {
+    sent = await invokeOnDevice(env, "gesture-rotate", {
       centerX: center.x,
       centerY: center.y,
       ...(aspect === undefined
@@ -1241,7 +1454,7 @@ async function runRotate(
     if (env.signal?.aborted) return ABORTED_OUTCOME;
     throw err;
   }
-  return { ok: true, ...warned(settle) };
+  return { ok: true, ...warnedBy(settle.warning, toolWarning(sent)) };
 }
 
 /**
@@ -1270,10 +1483,10 @@ const SWIPE_GEOMETRY: Record<
  * ({@link SWIPE_GEOMETRY}, clamped short at the screen edge), `by` (signed
  * relative delta delivered exactly: an unanchored start slides on-screen to fit
  * it, an authored anchor fails instead), or `to`. Touch dispatches one
- * `gesture-swipe`; Chromium has no touch, so a swipe is a mouse drag
- * (`gesture-drag`), where a `from` on a draggable node hands the gesture to the
- * browser's own drag-and-drop exactly as a real mouse would. `momentum` rides
- * both dispatches.
+ * `gesture-swipe`; the pointer desktops (Chromium, macOS) have no touch, so a
+ * swipe is a mouse drag (`gesture-drag`), where a `from` on a draggable node
+ * hands the gesture to the app's own drag-and-drop exactly as a real mouse
+ * would. `momentum` rides both dispatches.
  */
 async function runSwipe(
   env: ActionEnv,
@@ -1318,8 +1531,8 @@ async function runSwipe(
     if ("fail" in p) return p.fail;
     start = p;
   } else if (step.direction) {
-    // Copied, not aliased: SWIPE_GEOMETRY is shared by every swipe in the
-    // process, and the unanchored `by` arm below slides the local start in place.
+    // A fresh object: SWIPE_GEOMETRY is shared by every swipe in the process,
+    // and the unanchored `by` arm below slides the local start in place.
     start = { ...SWIPE_GEOMETRY[step.direction].start };
   } else {
     start = { x: 0.5, y: 0.5 };
@@ -1347,22 +1560,23 @@ async function runSwipe(
   let end: { x: number; y: number };
   if (step.direction) {
     const g = SWIPE_GEOMETRY[step.direction];
-    const startOnTravelAxis = start[g.axis];
+    const travelVector =
+      g.axis === "x" ? { x: g.end - g.start.x, y: 0 } : { x: 0, y: g.end - g.start.y };
+    const axis = g.axis;
+    const startOnTravelAxis = start[axis];
     // The preset line is the endpoint only for the unanchored default start; any
     // other anchor travels the preset's signed magnitude from where the finger
     // goes down, so an element in the last band of the axis still swipes in the
     // requested direction instead of reversing.
-    const endOnTravelAxis = step.from
-      ? clamp01(startOnTravelAxis + (g.end - g.start[g.axis]))
-      : g.end;
-    end = g.axis === "x" ? { x: endOnTravelAxis, y: start.y } : { x: start.x, y: endOnTravelAxis };
+    const endOnTravelAxis = step.from ? clamp01(startOnTravelAxis + travelVector[axis]) : g.end;
+    end = axis === "x" ? { x: endOnTravelAxis, y: start.y } : { x: start.x, y: endOnTravelAxis };
     // Clamping can only shorten travel, never flip its sign, so a below-floor
     // result means the anchor sits too near the edge to swipe.
     const travel = Math.abs(endOnTravelAxis - startOnTravelAxis);
     if (travel < SWIPE_MIN_TRAVEL) {
       return {
         ok: false,
-        reason: `cannot swipe ${step.direction} from ${g.axis}=${startOnTravelAxis}: only ${travel} of travel to the screen edge, less than the minimum swipe travel of ${SWIPE_MIN_TRAVEL} — a tap, not a swipe`,
+        reason: `cannot swipe ${step.direction} from ${axis}=${startOnTravelAxis}: only ${travel} of travel to the screen edge, less than the minimum swipe travel of ${SWIPE_MIN_TRAVEL} — a tap, not a swipe`,
       };
     }
   } else if (step.by) {
@@ -1448,10 +1662,11 @@ async function runSwipe(
     ...(step.duration !== undefined ? { durationMs: step.duration } : {}),
     ...(step.momentum === false ? { momentum: false } : {}),
   };
+  let sent: unknown;
   try {
-    await invokeOnDevice(
+    sent = await invokeOnDevice(
       env,
-      env.device.platform === "chromium" ? "gesture-drag" : "gesture-swipe",
+      isPointerDesktop(env.device) ? "gesture-drag" : "gesture-swipe",
       travel
     );
   } catch (err) {
@@ -1466,16 +1681,18 @@ async function runSwipe(
   // eats the touch and both steps still report pass. Unconditional, since
   // `momentum: false` zeroes the finger's release velocity, not the app's
   // animations.
-  try {
-    await settleTree(env);
-  } catch {
-    // Tree-source outage AFTER the gesture landed: proceed as runSnapshot's
-    // settle does rather than fail a swipe that happened.
+  if (supportsFlowTree(env.device.platform)) {
+    try {
+      await settleTree(env);
+    } catch {
+      // Tree-source outage AFTER the gesture landed: proceed as runSnapshot's
+      // settle does rather than fail a swipe that happened.
+    }
   }
   // settleTree returns undefined only on abort, which must read as the uniform
   // aborted skip, never a pass.
   if (env.signal?.aborted) return ABORTED_OUTCOME;
-  return { ok: true, ...warned(settle) };
+  return { ok: true, ...warnedBy(settle.warning, toolWarning(sent)) };
 }
 
 /**
@@ -1493,7 +1710,7 @@ async function runType(
   if (!frame) {
     return { ok: false, reason: offscreenHint(step.into) };
   }
-  await invokeOnDevice(env, "gesture-tap", getDescribeTapPoint(frame));
+  const focusTap = await invokeOnDevice(env, "gesture-tap", getDescribeTapPoint(frame));
   // Keys are injected at the HID level and go to whatever holds focus, so the
   // tap→type gap must cover the app's focus round-trip (see the constants).
   if (!(await sleepOrAbort(TYPE_FOCUS_SETTLE_MS, env.signal))) {
@@ -1517,7 +1734,7 @@ async function runType(
     // UDID.)
     await invokeOnDevice(env, "keyboard", { key: "enter" });
   }
-  return { ok: true };
+  return { ok: true, ...warnedBy(toolWarning(focusTap)) };
 }
 
 /**
@@ -1533,7 +1750,8 @@ async function runType(
  * - `assert` ({@link DEFAULT_ASSERT_TIMEOUT_MS}) — a correctness check that only
  *   absorbs the latency of an update landing a frame after an action.
  *
- * Mirrors `await-ui-element`'s blind-read guard: an EMPTY tree is not
+ * Applies the shared blind-read guard ({@link isBlindRead}), the same one
+ * `await-ui-element` polls with: an EMPTY tree is not
  * trustworthy evidence for `hidden` (the only condition an empty tree satisfies)
  * when the adapter flagged the read as degraded or the selector had matched on
  * an earlier poll — a transient blank frame mid-navigation must not confirm the
@@ -1551,7 +1769,10 @@ async function waitForCondition(
 ): Promise<DirectiveOutcome> {
   const deadline = Date.now() + timeoutMs;
 
+  // The last TRUSTED read's matches.
   let lastMatches: ReturnType<typeof findAll> = [];
+  // The read `lastMatches` came from, for the reason that quotes its text.
+  let lastData: DescribeTreeData | undefined;
   let fetchError: string | undefined;
   let everMatched = false;
   // Date.now() of the most recent TRUSTED read — undefined until one lands.
@@ -1560,29 +1781,46 @@ async function waitForCondition(
   // Whether the LAST completed read attempt was trusted — assigned on every pass
   // through the loop, so post-loop it describes the final poll.
   let lastReadTrusted: boolean;
+  // The hint of the last read when it was a `hidden` read of a Mac app's
+  // fallback walk, which is always blind: it names the cause, which the
+  // reasons below must not call an empty tree.
+  let fallbackHint: string | undefined;
   let finalPoll = false;
 
   for (;;) {
     if (env.signal?.aborted) return ABORTED_OUTCOME;
     try {
       const data = await readFlowTree(env);
-      lastMatches = flowFindAll(data.tree, step.selector);
+      const matches = flowFindAll(data.tree, step.selector);
       fetchError = undefined;
-      everMatched ||= lastMatches.length > 0;
-      const blind =
-        data.tree.children.length === 0 && Boolean(data.hint || data.should_restart || everMatched);
-      if (!blind) lastTrustedReadAt = Date.now();
+      everMatched ||= matches.length > 0;
+      const blind = isBlindRead(data, everMatched, step.condition);
+      if (!blind) {
+        lastMatches = matches;
+        lastData = data;
+        lastTrustedReadAt = Date.now();
+      }
       lastReadTrusted = !blind;
+      fallbackHint =
+        blind && step.condition === "hidden" && data.source === "macos-fallback"
+          ? data.hint
+          : undefined;
       if (
         !blind &&
-        evaluateCondition(step.condition, step.expectedText, lastMatches, step.textMatch)
+        evaluateCondition(
+          step.condition,
+          step.expectedText,
+          matches,
+          step.textMatch,
+          env.device.platform === "macos"
+        )
       ) {
         return { ok: true };
       }
     } catch (err) {
       fetchError = err instanceof Error ? err.message : String(err);
       // A throw is as blind as an empty tree — `lastMatches` still holds the
-      // previous successful read, which must not pass for current evidence.
+      // previous trusted read, which must not pass for current evidence.
       lastReadTrusted = false;
     }
     if (Date.now() >= deadline) {
@@ -1615,13 +1853,16 @@ async function waitForCondition(
   //    reads still describe the window, so a transient error on the trailing
   //    poll must not flip a clean skip into a hard error. The determinate
   //    verdict stands, with the failed final read appended rather than dropped.
+  const fallbackReason = `could not confirm the element is hidden: ${fallbackHint}`;
   if (lastTrustedReadAt === undefined) {
     return {
       ok: false,
       indeterminate: true,
       reason: fetchError
         ? `could not read the UI tree: ${fetchError}`
-        : "could not evaluate the condition — every read of the UI tree was empty or degraded",
+        : fallbackHint
+          ? fallbackReason
+          : "could not evaluate the condition — every read of the UI tree was empty or degraded",
     };
   }
   if (!lastReadTrusted) {
@@ -1637,7 +1878,9 @@ async function waitForCondition(
         indeterminate: true,
         reason: fetchError
           ? `could not confirm the element is hidden — it was visible earlier, but the last UI read failed: ${fetchError}`
-          : "could not confirm the element is hidden — it was visible earlier, but the last UI reads were empty",
+          : fallbackHint
+            ? fallbackReason
+            : "could not confirm the element is hidden — it was visible earlier, but the last UI reads were empty",
       };
     }
     const darkTailMs = Date.now() - lastTrustedReadAt;
@@ -1660,8 +1903,17 @@ async function waitForCondition(
   return {
     ok: false,
     reason:
-      assertReason(step.condition, step.selector, step.expectedText, step.textMatch, lastMatches) +
-      blipNote,
+      assertReason(
+        step.condition,
+        step.selector,
+        step.expectedText,
+        step.textMatch,
+        lastMatches,
+        env.device.platform === "macos",
+        // The text of an element is the only part of a reason that comes off
+        // the screen, where a field shows a typed secret.
+        (node, read) => (lastData ? quotedText(lastData, env.device.id, node, read) : read(node))
+      ) + blipNote,
   };
 }
 
@@ -1860,6 +2112,9 @@ async function waitForIdle(
   // frame in a run of twenty says nothing about that.
   let comparedAPair = false;
   let firstCapture = true;
+  // What the captures had to say: on a foldable whose panel could not be
+  // resolved, that they are of the cover panel.
+  let panelWarning: string | undefined;
 
   for (;;) {
     if (env.signal?.aborted) return ABORTED_OUTCOME;
@@ -1886,6 +2141,7 @@ async function waitForIdle(
       capturePixelsWithin(env, deadline, firstCapture),
     ]);
     firstCapture = false;
+    panelWarning ??= frame?.warning;
     // A capture abandoned by an abort comes back indistinguishable from one that
     // failed, and no verdict may be derived from a run that was cancelled.
     if (env.signal?.aborted || read.type === "aborted") return ABORTED_OUTCOME;
@@ -2022,9 +2278,13 @@ async function waitForIdle(
           heldForMs = now - bothSince;
           if (localizedThisInterval) localizedMotionDuringHold = true;
           if (stillIntervals >= MIN_STILL_INTERVALS && heldForMs >= stableFor) {
-            return localizedMotionDuringHold
-              ? { ok: true, warning: LOCALIZED_MOTION_WARNING }
-              : { ok: true };
+            return {
+              ok: true,
+              ...warnedBy(
+                localizedMotionDuringHold ? LOCALIZED_MOTION_WARNING : undefined,
+                panelWarning
+              ),
+            };
           }
         }
         // Otherwise the tree held and no pair could be compared: this round
@@ -2233,7 +2493,9 @@ function assertReason(
   selector: FlowSelector,
   expectedText: string | undefined,
   textMatch: TextMatchMode | undefined,
-  matches: ReturnType<typeof findAll>
+  matches: ReturnType<typeof findAll>,
+  macos: boolean,
+  quoted: (node: DescribeNode, read: (node: DescribeNode) => string) => string
 ): string {
   const sel = describeSelector(selector);
   switch (condition) {
@@ -2250,13 +2512,15 @@ function assertReason(
       // holds what that read saw: the element, still on screen.
       return `an element matching ${sel} was still visible`;
     case "text": {
-      const first = firstInReadingOrder(matches.filter(isVisible)) ?? firstInReadingOrder(matches);
+      // The same pick evaluateCondition made, so the reason quotes the element
+      // the check read.
+      const first = textCheckTarget(matches, macos);
       if (!first) return `no element matched selector ${sel}`;
       const wanted = describeTextExpectation(expectedText, textMatch, "infinitive");
       // The check accepts the element's own label/value as well as its hoisted
       // subtree text (see evaluateCondition), so quote both when they differ.
-      const shown = assertText(first);
-      const own = nodeText(first);
+      const shown = quoted(first, (node) => macFieldText(node, macos) ?? assertText(node));
+      const own = quoted(first, (node) => macFieldText(node, macos) ?? nodeText(node));
       const ownNote = own && own !== shown ? ` (own text "${own}")` : "";
       return `element matched ${sel} but its text was "${shown}"${ownNote} (wanted to ${wanted})`;
     }

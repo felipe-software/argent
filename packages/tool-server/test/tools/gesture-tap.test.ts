@@ -10,14 +10,31 @@ interface TouchCmd {
 }
 const sent: TouchCmd[] = [];
 vi.mock("../../src/utils/simulator-client", () => ({
-  sendCommand: (_api: unknown, cmd: TouchCmd) => {
+  sendCommand: async (_api: unknown, cmd: TouchCmd) => {
     sent.push(cmd);
+    return {};
   },
 }));
 
+import { FAILURE_CODES, getFailureSignal } from "@argent/registry";
 import { gestureTapTool } from "../../src/tools/gesture-tap";
+import { setCurrentIosDeviceApp } from "../../src/utils/ios-device/app-session";
 
 const touchServices = { simulatorServer: {} } as never;
+
+// Physical-iOS UDID shape (8 hex, dash, 16 hex) routes to the iosDevice
+// branch (see utils/device-info.ts).
+const DEVICE_UDID = "00008110-000978540290401E";
+
+// The device branch reads the viewport first, then taps; everything rides
+// the runner's `run`.
+function runnerRig() {
+  setCurrentIosDeviceApp(DEVICE_UDID, "com.example.app");
+  const run = vi.fn(async (req: Record<string, unknown>) =>
+    req.command === "viewport" ? { x: 0, y: 0, width: 390, height: 844 } : {}
+  );
+  return { run, services: { iosDeviceRunner: { udid: DEVICE_UDID, run } } as never };
+}
 
 beforeEach(() => {
   sent.length = 0;
@@ -34,6 +51,59 @@ describe("gesture-tap", () => {
     expect(sent.map((e) => e.type)).toEqual(["Down", "Up", "Down", "Up", "Down", "Up"]);
     // Every tap lands on the same point — a multi-tap, not a gesture path.
     expect(sent.every((e) => e.x === 0.4 && e.y === 0.6)).toBe(true);
+  });
+
+  it("physical iOS: a multi-tap rides ONE runner command carrying numberOfTaps", async () => {
+    // Fake timers pin the no-sleep contract: the old device branch awaited
+    // one tapAt wire round-trip per tap with a 100ms sleep between. Under
+    // fake timers that implementation never resolves. The runner owns the
+    // inter-tap timing on-device, so no gap belongs on this side of the wire.
+    vi.useFakeTimers();
+    try {
+      const { run, services } = runnerRig();
+      await gestureTapTool.execute(services, {
+        udid: DEVICE_UDID,
+        x: 0.5,
+        y: 0.5,
+        clickCount: 2,
+      });
+      const taps = run.mock.calls.filter(([req]) => req.command === "tap");
+      expect(taps).toHaveLength(1);
+      expect(taps[0][0]).toMatchObject({
+        command: "tap",
+        appBundleId: "com.example.app",
+        numberOfTaps: 2,
+      });
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("physical iOS: a count above 2 still rides one runner command, documented as looped single taps", async () => {
+    // Hardware has no N-tap API, so the runner loops single taps; the tool
+    // sends the count through unchanged and the description says how the
+    // taps land rather than refusing the request.
+    const { run, services } = runnerRig();
+    await gestureTapTool.execute(services, { udid: DEVICE_UDID, x: 0.5, y: 0.5, clickCount: 3 });
+    const taps = run.mock.calls.filter(([req]) => req.command === "tap");
+    expect(taps).toHaveLength(1);
+    expect(taps[0][0]).toMatchObject({ numberOfTaps: 3 });
+    expect(gestureTapTool.zodSchema!.shape.clickCount.description).toContain(
+      "higher counts loop single taps, which a double-tap recognizer may pair"
+    );
+  });
+
+  it("physical iOS: a single tap keeps its pre-numberOfTaps wire shape", async () => {
+    const { run, services } = runnerRig();
+    await gestureTapTool.execute(services, { udid: DEVICE_UDID, x: 0.5, y: 0.5 });
+    const taps = run.mock.calls.filter(([req]) => req.command === "tap");
+    expect(taps).toHaveLength(1);
+    expect(taps[0][0]).toEqual({
+      command: "tap",
+      appBundleId: "com.example.app",
+      x: 195,
+      y: 422,
+    });
   });
 
   it("escalates the CDP clickCount per click on chromium so dblclick fires", async () => {
@@ -58,5 +128,152 @@ describe("gesture-tap", () => {
       "mousePressed:2",
       "mouseReleased:2",
     ]);
+  });
+});
+
+describe("gesture-tap button", () => {
+  it("takes left and right, and rejects any other button at the schema", () => {
+    const schema = gestureTapTool.zodSchema!;
+    for (const button of ["left", "right", undefined]) {
+      expect(schema.safeParse({ udid: "X", x: 0.5, y: 0.5, button }).success).toBe(true);
+    }
+    for (const button of ["middle", "Right", 2]) {
+      expect(schema.safeParse({ udid: "X", x: 0.5, y: 0.5, button }).success).toBe(false);
+    }
+  });
+
+  it.each([
+    [
+      "an iOS simulator",
+      "00000000-0000-0000-0000-0000000000AB",
+      "ios simulator takes no right-click",
+      true,
+    ],
+    ["an Android emulator", "emulator-5554", "android emulator takes no right-click", true],
+    ["a physical iPhone", DEVICE_UDID, "ios device takes no right-click", true],
+    [
+      "a Chromium app",
+      "chromium-cdp-9222",
+      "argent does not support a right-click on a chromium app yet",
+      false,
+    ],
+  ])("refuses a right-click on %s and starts no backend", async (_name, udid, refusal, hold) => {
+    expect(gestureTapTool.services!({ udid, x: 0.5, y: 0.5, button: "right" })).toEqual({});
+    const { run } = runnerRig();
+    const err = await gestureTapTool
+      .execute({ simulatorServer: {}, iosDeviceRunner: { udid, run } } as never, {
+        udid,
+        x: 0.5,
+        y: 0.5,
+        button: "right",
+      })
+      .then(
+        () => undefined,
+        (e: unknown) => e as Error
+      );
+    expect(err?.message).toContain(refusal);
+    expect(err?.message.includes("gesture-custom")).toBe(hold);
+    expect(getFailureSignal(err)?.error_code).toBe(FAILURE_CODES.TOOL_INPUT_INVALID);
+    // Nothing reached a device: no touch, no runner command.
+    expect(sent).toEqual([]);
+    expect(run).not.toHaveBeenCalled();
+  });
+
+  it("sends a touch down and up on a touch device when the button is left", async () => {
+    await gestureTapTool.execute(touchServices, { udid: "X", x: 0.5, y: 0.5, button: "left" });
+    expect(sent.map((e) => e.type)).toEqual(["Down", "Up"]);
+  });
+});
+
+describe("gesture-tap modifiers", () => {
+  it("names each held key one time in the messages", () => {
+    const params = {
+      udid: "macos-app-com.example",
+      x: 0.5,
+      y: 0.25,
+      modifiers: ["command", "shift", "command"],
+    };
+    const interaction = gestureTapTool.interaction!;
+    expect(interaction.startedMsg!({ params } as never)).toBe(
+      "Tapping at (50%, 25%) holding command+shift"
+    );
+    expect(interaction.completedMsg!({ params, result: {} } as never)).toBe(
+      "Tapped at (50%, 25%) holding command+shift"
+    );
+  });
+
+  it("takes each modifier key and combinations, and rejects unknown names or more than four at the schema", () => {
+    const schema = gestureTapTool.zodSchema!;
+    for (const modifiers of [
+      undefined,
+      [],
+      ["control"],
+      ["option"],
+      ["shift"],
+      ["command"],
+      ["command", "shift"],
+      ["control", "option", "shift", "command"],
+    ]) {
+      expect(schema.safeParse({ udid: "X", x: 0.5, y: 0.5, modifiers }).success).toBe(true);
+    }
+    for (const modifiers of [
+      ["cmd"],
+      ["Command"],
+      ["command", "alt"],
+      "command",
+      ["control", "option", "shift", "command", "command"],
+    ]) {
+      expect(schema.safeParse({ udid: "X", x: 0.5, y: 0.5, modifiers }).success).toBe(false);
+    }
+  });
+
+  it.each([
+    [
+      "an iOS simulator",
+      "00000000-0000-0000-0000-0000000000AB",
+      "ios simulator takes no modifier keys in a tap.",
+    ],
+    ["an Android emulator", "emulator-5554", "android emulator takes no modifier keys in a tap."],
+    ["a physical iPhone", DEVICE_UDID, "ios device takes no modifier keys in a tap."],
+    [
+      "a Chromium app",
+      "chromium-cdp-9222",
+      "argent does not support modifier keys in a tap on a chromium app yet.",
+    ],
+  ])("refuses modifier keys on %s and starts no backend", async (_name, udid, refusal) => {
+    const params = { udid, x: 0.5, y: 0.5, modifiers: ["command" as const] };
+    expect(gestureTapTool.services!(params)).toEqual({});
+    const { run } = runnerRig();
+    const err = await gestureTapTool
+      .execute({ simulatorServer: {}, iosDeviceRunner: { udid, run } } as never, params)
+      .then(
+        () => undefined,
+        (e: unknown) => e as Error
+      );
+    expect(err?.message).toContain(refusal);
+    expect(getFailureSignal(err)?.error_code).toBe(FAILURE_CODES.TOOL_INPUT_INVALID);
+    // Nothing reached a device: no touch, no runner command.
+    expect(sent).toEqual([]);
+    expect(run).not.toHaveBeenCalled();
+  });
+
+  it("refuses a right-click before the modifier keys when a tap has both", async () => {
+    const udid = "emulator-5554";
+    const err = await gestureTapTool
+      .execute(touchServices, { udid, x: 0.5, y: 0.5, button: "right", modifiers: ["shift"] })
+      .then(
+        () => undefined,
+        (e: unknown) => e as Error
+      );
+    expect(err?.message).toContain("android emulator takes no right-click");
+    expect(err?.message).not.toContain("modifier keys");
+    expect(sent).toEqual([]);
+  });
+
+  it("taps as usual on a touch device when the modifier list is empty", async () => {
+    const udid = "00000000-0000-0000-0000-0000000000AB";
+    expect(gestureTapTool.services!({ udid, x: 0.5, y: 0.5, modifiers: [] })).not.toEqual({});
+    await gestureTapTool.execute(touchServices, { udid, x: 0.5, y: 0.5, modifiers: [] });
+    expect(sent.map((e) => e.type)).toEqual(["Down", "Up"]);
   });
 });

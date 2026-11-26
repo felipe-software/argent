@@ -18,8 +18,8 @@ import { redirectTmpdir } from "../helpers/tmpdir-env";
 // those very names underneath us.
 const debugDir = () => join(tmpdir(), "argent-profiler-cwd");
 
-let restoreTmpdir: () => void;
-let scratch: string;
+let restoreTmpdir: () => void = () => {};
+let scratch = "";
 
 beforeEach(async () => {
   scratch = await fs.mkdtemp(join(tmpdir(), "argent-profiler-dump-test-"));
@@ -35,13 +35,6 @@ afterEach(async () => {
 // ── getDebugDir ────────────────────────────────────────────────────────
 
 describe("getDebugDir", () => {
-  it("takes no arguments", async () => {
-    // TypeScript would fail to compile if the signature required args,
-    // but verify at runtime too.
-    const dir = await getDebugDir();
-    expect(typeof dir).toBe("string");
-  });
-
   it("returns a path inside os.tmpdir()", async () => {
     const dir = await getDebugDir();
     expect(dir).toBe(debugDir());

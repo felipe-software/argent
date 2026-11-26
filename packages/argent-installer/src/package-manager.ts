@@ -1,5 +1,15 @@
+import { execFileSync } from "node:child_process";
 import * as fs from "node:fs";
+import * as os from "node:os";
 import * as path from "node:path";
+import { canonicalPath } from "@argent/configuration-core";
+import { PACKAGE_NAME } from "./constants.js";
+import {
+  getRemainingGlobalBinaryPath,
+  packageRootOf,
+  readShimScript,
+  shimTargetOf,
+} from "./topology.js";
 
 export type PackageManager = "npm" | "yarn" | "pnpm" | "bun";
 
@@ -13,12 +23,112 @@ export function formatShellCommand(cmd: ShellCommand): string {
   return parts.join(" ");
 }
 
+// `dir` as one POSIX shell word, for a command the reader pastes. Single
+// quotes, because a discovered path can hold `$`, a backtick or `\`, which
+// double quotes leave live - retargeting the line.
+export function shellQuotePath(dir: string): string {
+  return "'" + dir.split("'").join("'\\''") + "'";
+}
+
 export function detectPackageManager(): PackageManager {
   const agent = process.env.npm_config_user_agent ?? "";
   if (agent.startsWith("yarn")) return "yarn";
   if (agent.startsWith("pnpm")) return "pnpm";
   if (agent.startsWith("bun")) return "bun";
   return "npm";
+}
+
+// pnpm keeps globals under <pnpm home>/global/<5 | v11/<hash>>/node_modules.
+const PNPM_GLOBAL_TARGET = new RegExp(
+  String.raw`[\\/]global[\\/]v?\d+[\\/][^"'\s]*node_modules[\\/]` +
+    PACKAGE_NAME.split("/").join(String.raw`[\\/]`) +
+    String.raw`[\\/]`
+);
+
+// bun keeps globals under <BUN_INSTALL>/install/global/node_modules.
+const BUN_GLOBAL_ROOT = new RegExp(
+  String.raw`[\\/]install[\\/]global[\\/]node_modules[\\/]` +
+    PACKAGE_NAME.split("/").join(String.raw`[\\/]`) +
+    "$"
+);
+
+// The manager that owns the global argent on PATH, read from its layout: any
+// other would add a second argent beside it. With no global the launcher's
+// manager installs, but Yarn 2+ has no `yarn global` and gets npm (over a Yarn
+// classic global it gets `yarn`, which fails there without installing anything).
+// npm's layout puts <prefix>/bin/argent beside <prefix>/lib/node_modules/@swmansion/argent,
+// or on Windows <prefix>\argent.cmd beside <prefix>\node_modules\@swmansion\argent.
+// A global in bun's folder gets bun; on Windows its bin is an .exe beside a
+// .bunx. A bin that resolves to no package is a shim script: pnpm's names its
+// global folder, so pnpm owns it. A shim that names no node_modules path
+// (nodenv's, asdf's) or is a binary (Volta's) runs a version manager's npm
+// global, so it keeps npm. Any other global sits outside npm's layout: a
+// lockfile above it names its manager, which covers a folder moved by pnpm's
+// global-dir or BUN_INSTALL_GLOBAL_DIR, and with none it is Yarn classic's.
+export function detectGlobalPackageManager(): PackageManager {
+  const binaryPath = getRemainingGlobalBinaryPath();
+  if (!binaryPath) return isYarnBerryLauncher() ? "npm" : detectPackageManager();
+  const root = packageRootOf(binaryPath);
+  if (root) {
+    if (isInNpmLayout(binaryPath, root)) return "npm";
+    return BUN_GLOBAL_ROOT.test(root) ? "bun" : (lockfileOwnerOf(root) ?? "yarn");
+  }
+  if (process.platform === "win32") {
+    if (fs.existsSync(path.join(npmCopyBeside(path.dirname(binaryPath)), "package.json"))) {
+      return "npm";
+    }
+    if (fs.existsSync(binaryPath.replace(/\.exe$/i, "") + ".bunx")) return "bun";
+  }
+  const shim = readShimScript(binaryPath);
+  if (shim === null || !/node_modules[\\/]/.test(shim)) return "npm";
+  if (PNPM_GLOBAL_TARGET.test(shim)) return "pnpm";
+  // The shim's own target, not its realpath: pnpm 11 links that into its store.
+  const target = shimTargetOf(binaryPath);
+  return (target ? lockfileOwnerOf(target) : null) ?? "yarn";
+}
+
+function lockfileOwnerOf(root: string): PackageManager | null {
+  for (let dir = path.dirname(root); path.dirname(dir) !== dir; dir = path.dirname(dir)) {
+    const pm = pmFromLockfile(dir);
+    if (pm) return pm;
+  }
+  return null;
+}
+
+function npmCopyBeside(binDir: string): string {
+  return process.platform === "win32"
+    ? path.join(binDir, "node_modules", PACKAGE_NAME)
+    : path.join(path.dirname(binDir), "lib", "node_modules", PACKAGE_NAME);
+}
+
+// The PATH entry can be a link to npm's bin, or sit in a linked directory, so
+// each hop of the bin's link chain is checked from its real directory.
+function isInNpmLayout(binaryPath: string, root: string): boolean {
+  const realRoot = canonicalPath(root);
+  let link = binaryPath;
+  for (let hop = 0; hop < 40; hop++) {
+    const binDir = canonicalPath(path.dirname(link));
+    if (canonicalPath(npmCopyBeside(binDir)) === realRoot) return true;
+    try {
+      link = path.resolve(binDir, fs.readlinkSync(link));
+    } catch {
+      return false;
+    }
+  }
+  return false;
+}
+
+function isYarnBerryLauncher(): boolean {
+  const agent = process.env.npm_config_user_agent ?? "";
+  return agent.startsWith("yarn") && !agent.startsWith("yarn/1.");
+}
+
+// Appended to a pasted `yarn global` command when the launcher is Yarn 2+, whose
+// own `yarn` rejects it.
+export function yarnClassicNote(cmd: ShellCommand): string {
+  return cmd.bin === "yarn" && cmd.args[0] === "global" && isYarnBerryLauncher()
+    ? " (with Yarn classic, outside this Yarn 2+ project)"
+    : "";
 }
 
 function asKnownPm(name: unknown): PackageManager | null {
@@ -116,6 +226,76 @@ export function globalInstallCommand(pm: PackageManager, pkg: string): ShellComm
   }
 }
 
+// Where and with what env a global command of `pm` runs. In a project, Yarn
+// classic defers to its yarnPath and corepack's shims to its `packageManager`
+// pin, which can swap in Yarn 2+ or refuse to run, so the other managers run in
+// home: Yarn reads a .yarnrc in every parent of its cwd, and only root can write
+// home's parents, unlike a shared /tmp. npm keeps the caller's cwd: it ignores
+// project config under -g, and under nodenv or asdf the cwd picks the Node whose
+// prefix holds the global. npm exec exports its prefix as npm_config_prefix,
+// which Yarn classic would take for its global bin dir.
+export function globalCommandOptions(pm: PackageManager): {
+  cwd?: string;
+  env?: NodeJS.ProcessEnv;
+} {
+  if (pm === "npm") return {};
+  const home = os.homedir();
+  const cwd = fs.existsSync(home) ? { cwd: home } : {};
+  if (pm !== "yarn" || !process.env.npm_config_user_agent?.startsWith("npm/")) return cwd;
+  const { npm_config_prefix: _npmPrefix, ...env } = process.env;
+  return { ...cwd, env };
+}
+
+// pnpm 11 installs each global package in its own directory. Its listing
+// names the actual package path on both sides of that layout change.
+const globalLocationArgs: Record<PackageManager, string[]> = {
+  npm: ["root", "-g"],
+  pnpm: ["list", "-g", "--depth", "0", "--json", PACKAGE_NAME],
+  yarn: ["global", "dir"],
+  bun: ["pm", "ls", "-g"],
+};
+
+function isRegistrySpec(spec: unknown): boolean {
+  return typeof spec === "string" && spec.length > 0 && !spec.includes(":") && !spec.includes("/");
+}
+
+/**
+ * A PATH shim alone cannot prove where an unattended global install would write,
+ * and a linked checkout must never be swapped for a release.
+ */
+export function ownsGlobalInstall(pm: PackageManager, runningRoot: string): boolean {
+  try {
+    const output = execFileSync(pm, globalLocationArgs[pm], {
+      ...globalCommandOptions(pm),
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "ignore"],
+      shell: process.platform === "win32",
+      timeout: 5000,
+    }).trim();
+    let pkg: string | undefined;
+    let localBuild: boolean;
+    if (pm === "pnpm") {
+      const listings = JSON.parse(output) as {
+        dependencies?: Record<string, { path: string; version?: string }>;
+      }[];
+      const dependency = listings[0]?.dependencies?.[PACKAGE_NAME];
+      pkg = dependency?.path;
+      localBuild = !isRegistrySpec(dependency?.version);
+    } else {
+      // Yarn reports the global project directory. Bun prefixes its package
+      // list with "<global project> node_modules (<count>)".
+      const dir = pm === "bun" ? /^([^\r\n]+) node_modules \(/.exec(output)?.[1] : output;
+      if (!dir || !path.isAbsolute(dir)) return false;
+      pkg =
+        pm === "npm" ? path.join(dir, PACKAGE_NAME) : path.join(dir, "node_modules", PACKAGE_NAME);
+      localBuild = fs.lstatSync(pkg).isSymbolicLink();
+    }
+    return !localBuild && !!pkg && path.isAbsolute(pkg) && fs.realpathSync(pkg) === runningRoot;
+  } catch {
+    return false;
+  }
+}
+
 export function globalUninstallCommand(pm: PackageManager, pkg: string): ShellCommand {
   switch (pm) {
     case "yarn":
@@ -137,7 +317,11 @@ export function localInstallCommand(pm: PackageManager, pkg: string): ShellComma
     case "yarn":
       return { bin: "yarn", args: ["add", "--dev", pkg] };
     case "pnpm":
-      return { bin: "pnpm", args: ["add", "-D", pkg] };
+      // At a workspace root pnpm refuses a bare `add` (ERR_PNPM_ADDING_TO_ROOT).
+      // Not `-w`: from a package inside a workspace it retargets the install to
+      // the root, and outside a workspace pnpm rejects it. This flag only skips
+      // the check, so the dependency still lands in the cwd's manifest.
+      return { bin: "pnpm", args: ["add", "-D", "--ignore-workspace-root-check", pkg] };
     case "bun":
       return { bin: "bun", args: ["add", "-d", pkg] };
     default:

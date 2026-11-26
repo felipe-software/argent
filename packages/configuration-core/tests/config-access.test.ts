@@ -12,6 +12,8 @@ import {
   listConfig,
   coerceCliValue,
   getAdditionalIosDeviceSets,
+  getAndroidSdkRoot,
+  getAndroidAdbServerPort,
   UnknownConfigKeyError,
   ConfigScopeError,
   ConfigValidationError,
@@ -20,6 +22,9 @@ import {
 import {
   CONFIG_SCHEMA,
   describeExpectedValue,
+  getConfigDefinition,
+  MIN_SCRIPT_HEAP_LIMIT_MB,
+  MIN_SCRIPT_TIMEOUT_MS,
   type ConfigDefinition,
 } from "../src/config-schema.js";
 
@@ -119,9 +124,11 @@ describe("setConfigValue — validation", () => {
   });
 
   it("rejects a project write for a global-only value via ConfigScopeError", () => {
-    // A settable, global-only definition supplied through the registry param
-    // (no shipped key is global-only any more, so a synthetic one isolates the
-    // scope check).
+    // A settable, global-only definition supplied through the registry param,
+    // so this checks the scope rule alone: a shipped global-only key — today
+    // `scripts.maxTimeoutMs` and `scripts.heapLimitMb`, covered further down —
+    // brings its own value parsing along, and would decide the case here on
+    // whichever rule refused first.
     const registry: ConfigDefinition[] = [
       {
         key: "test.onlyGlobal",
@@ -182,24 +189,14 @@ describe("setConfigValue — return value", () => {
   });
 });
 
-describe("getConfigValue — allowlist.enabled (prioritize-restrictive, no default)", () => {
-  it("reads as unset when never decided", () => {
-    expect(getConfigValueByKey("allowlist.enabled", opts())).toBeUndefined();
-  });
-
-  it("false in either scope wins over true in the other", () => {
-    setConfigValue("allowlist.enabled", true, "global", opts());
-    setConfigValue("allowlist.enabled", false, "project", opts());
-    expect(getConfigValueByKey("allowlist.enabled", opts())).toBe(false);
-
-    setConfigValue("allowlist.enabled", false, "global", opts());
-    setConfigValue("allowlist.enabled", true, "project", opts());
-    expect(getConfigValueByKey("allowlist.enabled", opts())).toBe(false);
-  });
-
-  it("a lone true opts in", () => {
-    setConfigValue("allowlist.enabled", true, "global", opts());
-    expect(getConfigValueByKey("allowlist.enabled", opts())).toBe(true);
+describe("autoUpdate.enabled", () => {
+  it("defaults on and accepts a machine-wide opt-out", () => {
+    expect(getConfigValueByKey("autoUpdate.enabled", opts())).toBe(true);
+    setConfigValue("autoUpdate.enabled", false, "global", opts());
+    expect(getConfigValueByKey("autoUpdate.enabled", opts())).toBe(false);
+    expect(() => setConfigValue("autoUpdate.enabled", true, "project", opts())).toThrow(
+      ConfigScopeError
+    );
   });
 });
 
@@ -215,6 +212,16 @@ describe("listConfig", () => {
     const telemetry = entries.find((e) => e.key === "telemetry.enabled")!;
     expect(telemetry.manageCommand).toBe("argent telemetry");
     expect(telemetry.scopes).toEqual(["project", "global"]);
+  });
+
+  it("lists a home-rooted project's values once, as global", () => {
+    setConfigValue("lens.agent", "codex", "global", opts());
+    const cwd = path.join(homeDir, "Downloads");
+    fs.mkdirSync(cwd);
+    const lens = listConfig({ homeDir, cwd }).find((e) => e.key === "lens.agent")!;
+    expect(lens.global).toBe("codex");
+    expect(lens.project).toBeUndefined();
+    expect(lens.effective).toBe("codex");
   });
 });
 
@@ -245,6 +252,42 @@ describe("coerceCliValue", () => {
     expect(coerceCliValue('["a","b"]')).toEqual(["a", "b"]);
     expect(coerceCliValue("/tmp/device-set")).toBe("/tmp/device-set");
     expect(coerceCliValue("claude")).toBe("claude");
+  });
+});
+
+describe("android.sdkRoot — project wins, ~ expands", () => {
+  it("reads as null when unset and rejects a relative path", () => {
+    expect(getAndroidSdkRoot(opts())).toBeNull();
+    for (const relative of ["sdk", "~sdk", "./sdk"]) {
+      expect(() => setConfigValue("android.sdkRoot", relative, "global", opts())).toThrow(
+        ConfigValidationError
+      );
+    }
+  });
+
+  it("returns the project value over the global one, with ~ expanded to home", () => {
+    setConfigValue("android.sdkRoot", "/opt/global-sdk", "global", opts());
+    expect(getAndroidSdkRoot(opts())).toBe(path.resolve("/opt/global-sdk"));
+    setConfigValue("android.sdkRoot", "~/Android/Sdk", "project", opts());
+    expect(getAndroidSdkRoot(opts())).toBe(path.join(homeDir, "Android/Sdk"));
+  });
+});
+
+describe("android.adbServerPort — project wins, a TCP port only", () => {
+  it("reads as null when unset and rejects anything but a port", () => {
+    expect(getAndroidAdbServerPort(opts())).toBeNull();
+    for (const bad of [0, 65536, 5037.5, "5038", -1]) {
+      expect(() => setConfigValue("android.adbServerPort", bad, "global", opts())).toThrow(
+        ConfigValidationError
+      );
+    }
+  });
+
+  it("returns the project value over the global one", () => {
+    setConfigValue("android.adbServerPort", 5038, "global", opts());
+    expect(getAndroidAdbServerPort(opts())).toBe(5038);
+    setConfigValue("android.adbServerPort", 6000, "project", opts());
+    expect(getAndroidAdbServerPort(opts())).toBe(6000);
   });
 });
 
@@ -318,6 +361,21 @@ describe("ios.additionalDeviceSets — additive union across scopes", () => {
       homeDir,
     ]);
   });
+
+  it.skipIf(process.platform === "win32")(
+    "resolves a home-rooted project's relative entries once when HOME is a symlink",
+    () => {
+      const linkedHome = path.join(projectDir, "home");
+      fs.symlinkSync(homeDir, linkedHome);
+      setConfigValue("ios.additionalDeviceSets", ["sets"], "global", { homeDir: linkedHome });
+      // Physical, like process.cwd().
+      const cwd = path.join(homeDir, "Downloads");
+      fs.mkdirSync(cwd);
+      expect(getAdditionalIosDeviceSets({ homeDir: linkedHome, cwd })).toEqual([
+        path.join(linkedHome, "sets"),
+      ]);
+    }
+  );
 });
 
 describe("getConfigValue — direct definition + custom-typed default", () => {
@@ -401,4 +459,47 @@ describe("deleteAtPath prunes only what it emptied", () => {
     expect(deleteAtPath(obj, "nope.missing")).toBe(false);
     expect(obj).toEqual({ ios: { deviceSet: "x" } });
   });
+});
+
+describe("flow script host bounds", () => {
+  it("refuses a heap limit too small for a Node process to start", () => {
+    expect(() => setConfigValue("scripts.heapLimitMb", 2, "global", opts())).toThrow(
+      ConfigValidationError
+    );
+    expect(() => setConfigValue("scripts.heapLimitMb", 16, "global", opts())).toThrow(
+      ConfigValidationError
+    );
+    expect(setConfigValue("scripts.heapLimitMb", MIN_SCRIPT_HEAP_LIMIT_MB, "global", opts())).toBe(
+      MIN_SCRIPT_HEAP_LIMIT_MB
+    );
+  });
+
+  it("refuses a ceiling the step spends on starting its own process", () => {
+    expect(() => setConfigValue("scripts.maxTimeoutMs", 30, "global", opts())).toThrow(
+      ConfigValidationError
+    );
+    expect(() => setConfigValue("scripts.maxTimeoutMs", 99, "global", opts())).toThrow(
+      ConfigValidationError
+    );
+    expect(setConfigValue("scripts.maxTimeoutMs", MIN_SCRIPT_TIMEOUT_MS, "global", opts())).toBe(
+      MIN_SCRIPT_TIMEOUT_MS
+    );
+  });
+
+  it.each([
+    ["scripts.heapLimitMb", MIN_SCRIPT_HEAP_LIMIT_MB],
+    ["scripts.maxTimeoutMs", MIN_SCRIPT_TIMEOUT_MS],
+  ])("says what %s wants when it refuses one", (key, min) => {
+    const def = getConfigDefinition(key)!;
+    expect(describeExpectedValue(def)).toContain(`at least ${min}`);
+  });
+
+  it.each(["scripts.maxTimeoutMs", "scripts.heapLimitMb"])(
+    "keeps %s out of project scope, so repository content cannot raise its own ceiling",
+    (key) => {
+      const def = getConfigDefinition(key)!;
+      expect(def.scopes).toEqual(["global"]);
+      expect(() => setConfigValue(key, 60_000, "project", opts())).toThrow();
+    }
+  );
 });

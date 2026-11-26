@@ -55,8 +55,8 @@ function rpcTimeout(): FailureError {
 function appState(bundleId: string): NativeAppState {
   return {
     bundleId,
-    applicationState: "active",
-    foregroundActiveSceneCount: 1,
+    applicationState: "inactive",
+    foregroundActiveSceneCount: 0,
     foregroundInactiveSceneCount: 0,
     backgroundSceneCount: 0,
     unattachedSceneCount: 0,
@@ -175,7 +175,7 @@ describe("queryFullHierarchyTree - pinned target vs poisoned auto-resolve", () =
     // The message must not advertise a refusal the guard does not deliver: it
     // is as lenient as auto-resolve over one app, so it says so.
     expect(message).toContain("Transitional states are NOT refused here");
-    expect(message).toContain("give the flow a `launch:` step for that app");
+    expect(message).toContain("give the e2e test a `launch:` step for that app");
     expect(message).toContain("demotes the pin and returns reads to frontmost auto-resolve");
     expect(message).not.toContain("clears the pin");
     expect(getFailureSignal(err)?.error_code).toBe(
@@ -289,15 +289,13 @@ describe("queryFullHierarchyTree - pinned target vs poisoned auto-resolve", () =
     const message = (err as Error).message;
     expect(message).toContain(`${APP} (the launched app) stopped answering Application.getState`);
     expect(message).toContain("an earlier one in this run answered");
-    // The escape hatch must be one that re-targets reads. A foreground-NEUTRAL
-    // `tool:` step is not: it demotes the pin back to a fan-out this same
-    // silent app sinks.
-    expect(message).toContain("give the flow a `launch:` step for that app");
+    // Launching names the intended target even when auto-resolve is inconclusive.
+    expect(message).toContain("give the e2e test a `launch:` step for that app");
     expect(message).toContain(
       "`tool: launch-app` or `tool: restart-app` naming that app works too"
     );
-    expect(message).toContain("how a recorded flow switches apps");
-    expect(message).toContain("A foreground-NEUTRAL raw `tool:` step does not work here");
+    expect(message).toContain("how a recorded e2e test switches apps");
+    expect(message).toContain("exactly one foreground-active response");
     expect(message).not.toContain("clears the pin");
     expect(message).not.toContain("returns reads to frontmost auto-resolve");
     // The timeout's own classification: no app state was observed here.
@@ -348,7 +346,7 @@ describe("queryFullHierarchyTree - pinned target vs poisoned auto-resolve", () =
     expect(message).not.toMatch(/instrumentation loaded/);
     // On iOS launch-app is `simctl launch`, which only foregrounds a live
     // process - the next read fails identically. restart-app terminates first.
-    expect(message).toContain("restart it (restart-app, or a flow `launch` step)");
+    expect(message).toContain("restart it (restart-app, or an e2e test `launch` step)");
     expect(message).not.toMatch(/relaunch it \(launch-app/);
     expect(getFailureSignal(err)?.error_code).toBe(FAILURE_CODES.NATIVE_DEVTOOLS_NOT_CONNECTED);
     // A dead pin is re-read every 300ms poll, and appConnectionState's miss
@@ -376,7 +374,7 @@ describe("queryFullHierarchyTree - pinned target vs poisoned auto-resolve", () =
     expect(err).toBeInstanceOf(Error);
     const message = (err as Error).message;
     expect(message).toContain(`${POISONER} is an Apple system app`);
-    expect(message).toContain("never a valid flow target");
+    expect(message).toContain("never a valid e2e test target");
     // Refusing here only helps if the message carries the coordinate remedy.
     expect(message).toContain(
       "`tap: { x: 0.5, y: 0.35 }` takes a point directly and reads no tree"
@@ -478,7 +476,7 @@ describe("queryFullHierarchyTree - an unpinned target arbitrates a timed-out fan
     // The diagnosis names both halves: the timed-out fan-out, and a fallback
     // that answered from the background.
     expect(message).toContain("auto-resolve's probe of every connection timed out");
-    expect(message).toContain("give the flow a `launch:` step for that app");
+    expect(message).toContain("give the e2e test a `launch:` step for that app");
     // A state WAS observed here, unlike the silent-hint rethrow below.
     expect(getFailureSignal(err)?.error_code).toBe(
       FAILURE_CODES.NATIVE_TARGET_SINGLE_APP_NOT_FOREGROUND
@@ -565,7 +563,7 @@ describe("queryFullHierarchyTree - an unpinned target arbitrates a timed-out fan
     expect(err).toBeInstanceOf(Error);
     const message = (err as Error).message;
     expect(message).toContain(`${POISONER} is an Apple system app`);
-    expect(message).toContain("never a valid flow target");
+    expect(message).toContain("never a valid e2e test target");
     // Whether a `tool:` step ran must not soften the refusal.
     expect(message).toContain(
       "`tap: { x: 0.5, y: 0.35 }` takes a point directly and reads no tree"
